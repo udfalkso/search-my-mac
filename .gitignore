@@ -1,0 +1,7 @@
+.DS_Store
+.build/
+rust-engine/target/
+*.xcuserstate
+DerivedData/
+Search My Mac.app/
+.smm-signing.env

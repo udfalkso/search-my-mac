@@ -1,0 +1,315 @@
+import Foundation
+
+public enum SearchMode: String, Codable, CaseIterable, Sendable {
+    case text
+    case semantic
+    case hybrid
+}
+
+public enum ContentAvailability: String, Codable, Sendable {
+    case available
+    case filenameOnly
+    case contentLocked
+    case waitingForDownload
+    case volumeOffline
+    case unsupported
+    case extractionFailed
+    case semanticPending
+}
+
+public enum StructuralLocationKind: String, Codable, Sendable {
+    case page
+    case slide
+    case sheet
+    case section
+    case line
+    case unknown
+}
+
+public struct SearchFilters: Codable, Equatable, Sendable {
+    public var rootIDs: Set<String>
+    public var pathPrefixes: Set<String>
+    public var extensions: Set<String>
+    public var modifiedAfter: Date?
+    public var modifiedBefore: Date?
+
+    public init(
+        rootIDs: Set<String> = [],
+        pathPrefixes: Set<String> = [],
+        extensions: Set<String> = [],
+        modifiedAfter: Date? = nil,
+        modifiedBefore: Date? = nil
+    ) {
+        self.rootIDs = rootIDs
+        self.pathPrefixes = pathPrefixes
+        self.extensions = extensions
+        self.modifiedAfter = modifiedAfter
+        self.modifiedBefore = modifiedBefore
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case rootIDs, pathPrefixes, extensions, modifiedAfter, modifiedBefore
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        rootIDs = try values.decodeIfPresent(Set<String>.self, forKey: .rootIDs) ?? []
+        pathPrefixes = try values.decodeIfPresent(Set<String>.self, forKey: .pathPrefixes) ?? []
+        extensions = try values.decodeIfPresent(Set<String>.self, forKey: .extensions) ?? []
+        modifiedAfter = try values.decodeIfPresent(Date.self, forKey: .modifiedAfter)
+        modifiedBefore = try values.decodeIfPresent(Date.self, forKey: .modifiedBefore)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(rootIDs, forKey: .rootIDs)
+        try values.encode(pathPrefixes, forKey: .pathPrefixes)
+        try values.encode(extensions, forKey: .extensions)
+        try values.encodeIfPresent(modifiedAfter, forKey: .modifiedAfter)
+        try values.encodeIfPresent(modifiedBefore, forKey: .modifiedBefore)
+    }
+}
+
+public struct SearchRequest: Codable, Equatable, Sendable {
+    public var id: UUID
+    public var query: String
+    public var mode: SearchMode
+    public var filters: SearchFilters
+    public var limit: Int
+    public var cursor: String?
+
+    public init(
+        id: UUID = UUID(),
+        query: String,
+        mode: SearchMode = .text,
+        filters: SearchFilters = .init(),
+        limit: Int = 50,
+        cursor: String? = nil
+    ) {
+        self.id = id
+        self.query = query
+        self.mode = mode
+        self.filters = filters
+        self.limit = min(max(limit, 1), 200)
+        self.cursor = cursor
+    }
+}
+
+public struct HighlightRange: Codable, Equatable, Sendable {
+    public var location: Int
+    public var length: Int
+
+    public init(location: Int, length: Int) {
+        self.location = location
+        self.length = length
+    }
+}
+
+public struct SearchSnippet: Identifiable, Codable, Equatable, Sendable {
+    public var id: String
+    public var text: String
+    public var highlights: [HighlightRange]
+    public var locationKind: StructuralLocationKind
+    public var locationLabel: String?
+    public var score: Double
+
+    public init(
+        id: String,
+        text: String,
+        highlights: [HighlightRange] = [],
+        locationKind: StructuralLocationKind = .unknown,
+        locationLabel: String? = nil,
+        score: Double = 0
+    ) {
+        self.id = id
+        self.text = text
+        self.highlights = highlights
+        self.locationKind = locationKind
+        self.locationLabel = locationLabel
+        self.score = score
+    }
+}
+
+public struct SearchHit: Identifiable, Codable, Equatable, Sendable {
+    public var id: String
+    public var url: URL
+    public var filename: String
+    public var path: String
+    public var fileExtension: String
+    public var modifiedAt: Date?
+    public var availability: ContentAvailability
+    public var score: Double
+    public var snippets: [SearchSnippet]
+
+    public init(
+        id: String,
+        url: URL,
+        filename: String,
+        path: String,
+        fileExtension: String,
+        modifiedAt: Date?,
+        availability: ContentAvailability,
+        score: Double,
+        snippets: [SearchSnippet]
+    ) {
+        self.id = id
+        self.url = url
+        self.filename = filename
+        self.path = path
+        self.fileExtension = fileExtension
+        self.modifiedAt = modifiedAt
+        self.availability = availability
+        self.score = score
+        self.snippets = snippets
+    }
+}
+
+public struct SearchResponse: Codable, Equatable, Sendable {
+    public var requestID: UUID
+    public var generation: Int64
+    public var hits: [SearchHit]
+    public var nextCursor: String?
+    public var effectiveMode: SearchMode
+
+    public init(
+        requestID: UUID,
+        generation: Int64,
+        hits: [SearchHit],
+        nextCursor: String? = nil,
+        effectiveMode: SearchMode
+    ) {
+        self.requestID = requestID
+        self.generation = generation
+        self.hits = hits
+        self.nextCursor = nextCursor
+        self.effectiveMode = effectiveMode
+    }
+}
+
+public struct IndexRoot: Identifiable, Codable, Equatable, Sendable {
+    public var id: String
+    public var url: URL
+    public var displayName: String
+    public var isEnabled: Bool
+    public var isAvailable: Bool
+    public var bookmarkData: Data?
+
+    public init(
+        id: String = UUID().uuidString,
+        url: URL,
+        displayName: String? = nil,
+        isEnabled: Bool = true,
+        isAvailable: Bool = true,
+        bookmarkData: Data? = nil
+    ) {
+        self.id = id
+        self.url = url
+        self.displayName = displayName ?? url.lastPathComponent
+        self.isEnabled = isEnabled
+        self.isAvailable = isAvailable
+        self.bookmarkData = bookmarkData
+    }
+}
+
+public enum IndexPhase: String, Codable, Sendable {
+    case idle
+    case discovering
+    case extracting
+    case committing
+    case reconciling
+    case paused
+    case failed
+}
+
+public struct IndexProgress: Codable, Equatable, Sendable {
+    public var phase: IndexPhase
+    public var fraction: Double?
+    public var discovered: Int
+    public var eligible: Int
+    public var completed: Int
+    public var skipped: Int
+    public var failed: Int
+    public var queuedChanges: Int
+    public var currentActivity: String?
+    public var pauseReason: String?
+
+    public init(
+        phase: IndexPhase = .idle,
+        fraction: Double? = nil,
+        discovered: Int = 0,
+        eligible: Int = 0,
+        completed: Int = 0,
+        skipped: Int = 0,
+        failed: Int = 0,
+        queuedChanges: Int = 0,
+        currentActivity: String? = nil,
+        pauseReason: String? = nil
+    ) {
+        self.phase = phase
+        self.fraction = fraction
+        self.discovered = discovered
+        self.eligible = eligible
+        self.completed = completed
+        self.skipped = skipped
+        self.failed = failed
+        self.queuedChanges = queuedChanges
+        self.currentActivity = currentActivity
+        self.pauseReason = pauseReason
+    }
+}
+
+public struct SearchHistoryEntry: Identifiable, Codable, Equatable, Sendable {
+    public var id: String
+    public var query: String
+    public var mode: SearchMode
+    public var searchedAt: Date
+
+    public init(id: String = UUID().uuidString, query: String, mode: SearchMode, searchedAt: Date = .now) {
+        self.id = id
+        self.query = query
+        self.mode = mode
+        self.searchedAt = searchedAt
+    }
+}
+
+public struct SavedSearch: Identifiable, Codable, Equatable, Sendable {
+    public var id: String
+    public var name: String
+    public var request: SearchRequest
+    public var createdAt: Date
+
+    public init(id: String = UUID().uuidString, name: String, request: SearchRequest, createdAt: Date = .now) {
+        self.id = id
+        self.name = name
+        self.request = request
+        self.createdAt = createdAt
+    }
+}
+
+public struct IndexHealth: Codable, Equatable, Sendable {
+    public var fileCount: Int
+    public var passageCount: Int
+    public var failedCount: Int
+    public var filenameOnlyCount: Int
+    public var inaccessibleLocationCount: Int
+    public var databaseBytes: Int64
+    public var generation: Int64
+
+    public init(
+        fileCount: Int = 0,
+        passageCount: Int = 0,
+        failedCount: Int = 0,
+        filenameOnlyCount: Int = 0,
+        inaccessibleLocationCount: Int = 0,
+        databaseBytes: Int64 = 0,
+        generation: Int64 = 0
+    ) {
+        self.fileCount = fileCount
+        self.passageCount = passageCount
+        self.failedCount = failedCount
+        self.filenameOnlyCount = filenameOnlyCount
+        self.inaccessibleLocationCount = inaccessibleLocationCount
+        self.databaseBytes = databaseBytes
+        self.generation = generation
+    }
+}
