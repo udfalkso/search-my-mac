@@ -1,6 +1,19 @@
 import Darwin
 import Foundation
 
+struct SemanticPassageRecord: Sendable {
+    let id: UInt64
+    let text: String
+    let filename: String
+}
+
+struct ExclusionPurgeBatch: Sendable {
+    let lastRowID: Int64
+    let examined: Int
+    let removed: Int
+    let isFinished: Bool
+}
+
 actor ManifestStore {
     private let database: SQLiteDatabase
     private let parser = LexicalQueryParser()
@@ -78,6 +91,57 @@ actor ManifestStore {
         try database.execute(
             "UPDATE root_events SET discovery_error_count = ? WHERE root_id = ?",
             bindings: [.integer(Int64(max(0, count))), .text(rootID)]
+        )
+    }
+
+    func discoveryPolicyVersion(rootID: String) throws -> Int {
+        Int(try database.query(
+            "SELECT discovery_policy_version FROM root_events WHERE root_id = ?",
+            bindings: [.text(rootID)]
+        ).first?["discovery_policy_version"]?.int64 ?? 0)
+    }
+
+    func setDiscoveryPolicyVersion(rootID: String, version: Int) throws {
+        try database.execute(
+            "UPDATE root_events SET discovery_policy_version = ? WHERE root_id = ?",
+            bindings: [.integer(Int64(version)), .text(rootID)]
+        )
+    }
+
+    func purgeExcludedFilesBatch(
+        root: IndexRoot,
+        policy: DiscoveryPolicy,
+        afterRowID: Int64,
+        limit: Int
+    ) throws -> ExclusionPurgeBatch {
+        let safeLimit = max(1, limit)
+        let rows = try database.query(
+            """
+            SELECT rowid AS manifest_rowid, source_id, path
+            FROM files
+            WHERE root_id = ? AND rowid > ?
+            ORDER BY rowid
+            LIMIT ?
+            """,
+            bindings: [.text(root.id), .integer(afterRowID), .integer(Int64(safeLimit))]
+        )
+        let lastRowID = rows.last?["manifest_rowid"]?.int64 ?? afterRowID
+        var removed = 0
+        try database.transaction {
+            for row in rows {
+                guard let sourceID = row["source_id"]?.string,
+                      let path = row["path"]?.string,
+                      policy.excludesIndexedFile(URL(fileURLWithPath: path), under: root.url) else { continue }
+                try deleteFile(sourceID: sourceID)
+                removed += 1
+            }
+            if removed > 0 { try incrementGeneration() }
+        }
+        return ExclusionPurgeBatch(
+            lastRowID: lastRowID,
+            examined: rows.count,
+            removed: removed,
+            isFinished: rows.count < safeLimit
         )
     }
 
@@ -183,21 +247,30 @@ actor ManifestStore {
         ).first?["count"]?.int64 ?? 0)
     }
 
-    /// Reconciles deletions only after a complete, successful enumeration of an available root.
-    func finishScan(scanID: String, rootID: String, reconcileDeletions: Bool) throws {
+    /// Reconciles ordinary deletions only after a complete scan. Files rejected by
+    /// the current discovery policy are safe to remove even when unrelated paths
+    /// were inaccessible, which also cleans records created by older policies.
+    func finishScan(
+        scanID: String,
+        root: IndexRoot,
+        policy: DiscoveryPolicy,
+        reconcileDeletions: Bool
+    ) throws {
         try database.transaction {
-            if reconcileDeletions {
-                let missing = try database.query(
-                    """
-                    SELECT source_id FROM files
-                    WHERE root_id = ? AND source_id NOT IN (
-                        SELECT source_id FROM scan_items WHERE scan_id = ?
-                    )
-                    """,
-                    bindings: [.text(rootID), .text(scanID)]
+            let missing = try database.query(
+                """
+                SELECT source_id, path FROM files
+                WHERE root_id = ? AND source_id NOT IN (
+                    SELECT source_id FROM scan_items WHERE scan_id = ?
                 )
-                for row in missing {
-                    if let sourceID = row["source_id"]?.string { try deleteFile(sourceID: sourceID) }
+                """,
+                bindings: [.text(root.id), .text(scanID)]
+            )
+            for row in missing {
+                guard let sourceID = row["source_id"]?.string,
+                      let path = row["path"]?.string else { continue }
+                if reconcileDeletions || policy.excludesIndexedFile(URL(fileURLWithPath: path), under: root.url) {
+                    try deleteFile(sourceID: sourceID)
                 }
             }
             try database.execute("DELETE FROM scan_items WHERE scan_id = ?", bindings: [.text(scanID)])
@@ -295,7 +368,7 @@ actor ManifestStore {
         return abs(oldModified - newModified) > 0.000_001
     }
 
-    func search(_ request: SearchRequest) throws -> SearchResponse {
+    func search(_ request: SearchRequest, recordInHistory: Bool = true) throws -> SearchResponse {
         let match = try parser.parse(request.query)
         let currentGeneration = try generation()
         let offset = try cursorOffset(request.cursor, expectedGeneration: currentGeneration)
@@ -401,7 +474,7 @@ actor ManifestStore {
         .sorted { $0.score > $1.score }
         .prefix(request.limit)
 
-        if historyRecordingEnabled {
+        if recordInHistory && historyRecordingEnabled {
             try recordHistory(SearchHistoryEntry(query: request.query, mode: request.mode))
         }
         let nextCursor = rows.count >= max(request.limit * 8, 200)
@@ -414,6 +487,160 @@ actor ManifestStore {
             nextCursor: nextCursor,
             effectiveMode: .text
         )
+    }
+
+    func semanticCounts(modelID: String) throws -> (embedded: Int, total: Int) {
+        let row = try database.query(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN embedding_model = ? THEN 1 ELSE 0 END) AS embedded
+            FROM passages WHERE length(trim(body)) > 0
+            """,
+            bindings: [.text(modelID)]
+        ).first ?? [:]
+        return (Int(row["embedded"]?.int64 ?? 0), Int(row["total"]?.int64 ?? 0))
+    }
+
+    func nextSemanticPassages(modelID: String, limit: Int) throws -> [SemanticPassageRecord] {
+        try database.query(
+            """
+            SELECT p.id, p.body, f.filename
+            FROM passages p JOIN files f ON f.source_id = p.source_id
+            WHERE length(trim(p.body)) > 0 AND COALESCE(p.embedding_model, '') != ?
+            ORDER BY COALESCE(f.modified_at, 0) DESC, p.id
+            LIMIT ?
+            """,
+            bindings: [.text(modelID), .integer(Int64(max(1, limit)))]
+        ).compactMap { row in
+            guard let id = row["id"]?.int64, id >= 0, let text = row["body"]?.string else { return nil }
+            return SemanticPassageRecord(id: UInt64(id), text: text, filename: row["filename"]?.string ?? "")
+        }
+    }
+
+    func markPassageEmbedded(id: UInt64, modelID: String) throws {
+        try database.execute(
+            "UPDATE passages SET embedding_model = ?, embedded_at = ? WHERE id = ?",
+            bindings: [.text(modelID), .real(Date.now.timeIntervalSince1970), .integer(Int64(clamping: id))]
+        )
+    }
+
+    func pendingSemanticTombstones(limit: Int) throws -> [UInt64] {
+        try database.query(
+            "SELECT passage_id FROM semantic_tombstones ORDER BY passage_id LIMIT ?",
+            bindings: [.integer(Int64(max(1, limit)))]
+        ).compactMap { row in
+            guard let value = row["passage_id"]?.int64, value >= 0 else { return nil }
+            return UInt64(value)
+        }
+    }
+
+    func clearSemanticTombstones(_ keys: [UInt64]) throws {
+        guard !keys.isEmpty else { return }
+        try database.execute(
+            "DELETE FROM semantic_tombstones WHERE passage_id IN (\(placeholders(keys.count)))",
+            bindings: keys.map { .integer(Int64(clamping: $0)) }
+        )
+    }
+
+    func resetSemanticEmbeddings() throws {
+        try database.execute("UPDATE passages SET embedding_model = NULL, embedded_at = NULL")
+        try database.execute("DELETE FROM semantic_tombstones")
+    }
+
+    func recordSearch(query: String, mode: SearchMode) throws {
+        guard historyRecordingEnabled else { return }
+        try recordHistory(SearchHistoryEntry(query: query, mode: mode))
+    }
+
+    func semanticSearchResponse(matches: [VectorMatch], request: SearchRequest) throws -> SearchResponse {
+        let currentGeneration = try generation()
+        guard !matches.isEmpty else {
+            return SearchResponse(requestID: request.id, generation: currentGeneration, hits: [], effectiveMode: .semantic)
+        }
+        let scores = Dictionary(uniqueKeysWithValues: matches.map { (Int64(clamping: $0.key), Double($0.score)) })
+        var conditions = ["p.id IN (\(placeholders(matches.count)))"]
+        var bindings: [SQLiteValue] = matches.map { .integer(Int64(clamping: $0.key)) }
+        appendSearchFilters(request.filters, conditions: &conditions, bindings: &bindings)
+        let rows = try database.query(
+            """
+            SELECT p.id AS passage_id, p.source_id, p.body, p.location_kind, p.location_label,
+                   f.path, f.filename, f.extension, f.modified_at, f.availability
+            FROM passages p JOIN files f ON f.source_id = p.source_id
+            WHERE \(conditions.joined(separator: " AND "))
+            """,
+            bindings: bindings
+        )
+        var grouped: [String: [PassageMatch]] = [:]
+        for row in rows {
+            guard let sourceID = row["source_id"]?.string,
+                  let path = row["path"]?.string,
+                  let filename = row["filename"]?.string,
+                  let passageID = row["passage_id"]?.int64 else { continue }
+            let body = row["body"]?.string ?? ""
+            grouped[sourceID, default: []].append(PassageMatch(
+                sourceID: sourceID, path: path, filename: filename,
+                fileExtension: row["extension"]?.string ?? "",
+                modifiedAt: row["modified_at"]?.double.map(Date.init(timeIntervalSince1970:)),
+                availability: ContentAvailability(rawValue: row["availability"]?.string ?? "") ?? .filenameOnly,
+                passageID: String(passageID), excerpt: Self.semanticExcerpt(body),
+                locationKind: StructuralLocationKind(rawValue: row["location_kind"]?.string ?? "") ?? .unknown,
+                locationLabel: row["location_label"]?.string,
+                score: scores[passageID] ?? 0
+            ))
+        }
+        let terms = parser.highlightTerms(request.query)
+        let hits = grouped.values.compactMap { passages -> SearchHit? in
+            let top = passages.sorted { $0.score > $1.score }.prefix(3)
+            guard let first = top.first else { return nil }
+            return SearchHit(
+                id: first.sourceID, url: URL(fileURLWithPath: first.path), filename: first.filename,
+                path: first.path, fileExtension: first.fileExtension, modifiedAt: first.modifiedAt,
+                availability: first.availability, score: first.score,
+                snippets: top.map { passage in
+                    SearchSnippet(id: passage.passageID, text: passage.excerpt,
+                                  highlights: highlightRanges(in: passage.excerpt, terms: terms),
+                                  locationKind: passage.locationKind, locationLabel: passage.locationLabel,
+                                  score: passage.score)
+                }
+            )
+        }.sorted { $0.score > $1.score }.prefix(request.limit)
+        return SearchResponse(requestID: request.id, generation: currentGeneration, hits: Array(hits), effectiveMode: .semantic)
+    }
+
+    private func appendSearchFilters(_ filters: SearchFilters, conditions: inout [String], bindings: inout [SQLiteValue]) {
+        if !filters.rootIDs.isEmpty || !filters.pathPrefixes.isEmpty {
+            var locations: [String] = []
+            if !filters.rootIDs.isEmpty {
+                locations.append("f.root_id IN (\(placeholders(filters.rootIDs.count)))")
+                bindings.append(contentsOf: filters.rootIDs.sorted().map(SQLiteValue.text))
+            }
+            for prefix in filters.pathPrefixes.sorted() {
+                for variant in pathVariants(prefix) {
+                    locations.append("f.path LIKE ? ESCAPE '\\'")
+                    bindings.append(.text(escapeLike(variant) + "/%"))
+                }
+            }
+            conditions.append("(\(locations.joined(separator: " OR ")))")
+        }
+        if !filters.extensions.isEmpty {
+            conditions.append("f.extension IN (\(placeholders(filters.extensions.count)))")
+            bindings.append(contentsOf: filters.extensions.sorted().map { .text($0.lowercased()) })
+        }
+        if let after = filters.modifiedAfter {
+            conditions.append("f.modified_at >= ?")
+            bindings.append(.real(after.timeIntervalSince1970))
+        }
+        if let before = filters.modifiedBefore {
+            conditions.append("f.modified_at <= ?")
+            bindings.append(.real(before.timeIntervalSince1970))
+        }
+    }
+
+    private static func semanticExcerpt(_ text: String) -> String {
+        let compact = text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard compact.count > 420 else { return compact }
+        return String(compact.prefix(417)) + "…"
     }
 
     func health() throws -> IndexHealth {
@@ -437,6 +664,93 @@ actor ManifestStore {
             databaseBytes: bytes,
             generation: try generation()
         )
+    }
+
+    func indexingPreferences() throws -> IndexingPreferences {
+        guard let data = try database.query(
+            "SELECT value FROM index_preferences WHERE key = 'preferences'"
+        ).first?["value"]?.blobData else { return IndexingPreferences() }
+        return (try? JSONDecoder().decode(IndexingPreferences.self, from: data)) ?? IndexingPreferences()
+    }
+
+    func setIndexingPreferences(_ preferences: IndexingPreferences) throws {
+        let normalizedPaths = Set(preferences.excludedFolderPaths.map {
+            URL(fileURLWithPath: $0).standardizedFileURL.path
+        })
+        var normalized = preferences
+        normalized.excludedFolderPaths = normalizedPaths
+        try database.execute(
+            "INSERT OR REPLACE INTO index_preferences(key, value) VALUES('preferences', ?)",
+            bindings: [.blob(try JSONEncoder().encode(normalized))]
+        )
+    }
+
+    func folderUsage(limit: Int) throws -> [IndexFolderUsage] {
+        let rootsByID = Dictionary(uniqueKeysWithValues: try roots().map { ($0.id, $0) })
+        let rows = try database.query(
+            """
+            SELECT f.root_id, f.path, COUNT(p.id) AS passage_count,
+                   COALESCE(SUM(length(CAST(p.body AS BLOB))), 0) AS text_bytes
+            FROM files f
+            LEFT JOIN passages p ON p.source_id = f.source_id
+            GROUP BY f.source_id
+            """
+        )
+        struct Aggregate {
+            var fileCount = 0
+            var passageCount = 0
+            var textBytes: Int64 = 0
+        }
+        var totals: [String: Aggregate] = [:]
+        var metadata: [String: (rootID: String, name: String)] = [:]
+
+        for row in rows {
+            guard let rootID = row["root_id"]?.string,
+                  let filePath = row["path"]?.string,
+                  let root = rootsByID[rootID] else { continue }
+            let rootPath = root.url.standardizedFileURL.path
+            let fileURL = URL(fileURLWithPath: filePath).standardizedFileURL
+            let relative = fileURL.pathComponents.dropFirst(root.url.standardizedFileURL.pathComponents.count)
+            let folderPath: String
+            let name: String
+            if let first = relative.first, relative.count > 1 {
+                folderPath = URL(fileURLWithPath: rootPath).appendingPathComponent(first).path
+                name = first
+            } else {
+                folderPath = rootPath
+                name = root.displayName
+            }
+            let key = rootID + "\u{0}" + folderPath
+            var aggregate = totals[key, default: Aggregate()]
+            aggregate.fileCount += 1
+            aggregate.passageCount += Int(row["passage_count"]?.int64 ?? 0)
+            aggregate.textBytes += row["text_bytes"]?.int64 ?? 0
+            totals[key] = aggregate
+            metadata[key] = (rootID, name)
+        }
+
+        return totals.compactMap { key, aggregate in
+            guard let values = metadata[key], let separator = key.firstIndex(of: "\u{0}") else { return nil }
+            return IndexFolderUsage(
+                rootID: values.rootID,
+                path: String(key[key.index(after: separator)...]),
+                displayName: values.name,
+                fileCount: aggregate.fileCount,
+                passageCount: aggregate.passageCount,
+                indexedTextBytes: aggregate.textBytes
+            )
+        }
+        .sorted {
+            if $0.indexedTextBytes != $1.indexedTextBytes { return $0.indexedTextBytes > $1.indexedTextBytes }
+            return $0.fileCount > $1.fileCount
+        }
+        .prefix(max(1, limit))
+        .map { $0 }
+    }
+
+    func compact() throws {
+        _ = try database.query("PRAGMA wal_checkpoint(TRUNCATE)")
+        try database.execute("VACUUM")
     }
 
     func history(limit: Int) throws -> [SearchHistoryEntry] {
@@ -509,6 +823,14 @@ actor ManifestStore {
             )
             """
         )
+        try database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS index_preferences(
+                key TEXT PRIMARY KEY,
+                value BLOB NOT NULL
+            )
+            """
+        )
         // Upgrade databases created by the earliest development builds.
         try? database.execute("ALTER TABLE roots ADD COLUMN bookmark BLOB")
         try database.execute(
@@ -517,11 +839,13 @@ actor ManifestStore {
                 root_id TEXT PRIMARY KEY REFERENCES roots(id) ON DELETE CASCADE,
                 last_event_id INTEGER NOT NULL DEFAULT 0,
                 last_reconciled_at REAL,
-                discovery_error_count INTEGER NOT NULL DEFAULT 0
+                discovery_error_count INTEGER NOT NULL DEFAULT 0,
+                discovery_policy_version INTEGER NOT NULL DEFAULT 0
             )
             """
         )
         try? database.execute("ALTER TABLE root_events ADD COLUMN discovery_error_count INTEGER NOT NULL DEFAULT 0")
+        try? database.execute("ALTER TABLE root_events ADD COLUMN discovery_policy_version INTEGER NOT NULL DEFAULT 0")
         try database.execute(
             """
             CREATE TABLE IF NOT EXISTS files(
@@ -570,7 +894,13 @@ actor ManifestStore {
             )
             """
         )
+        try? database.execute("ALTER TABLE passages ADD COLUMN embedding_model TEXT")
+        try? database.execute("ALTER TABLE passages ADD COLUMN embedded_at REAL")
         try database.execute("CREATE INDEX IF NOT EXISTS passages_source_idx ON passages(source_id)")
+        try database.execute("CREATE INDEX IF NOT EXISTS passages_embedding_idx ON passages(embedding_model)")
+        try database.execute(
+            "CREATE TABLE IF NOT EXISTS semantic_tombstones(passage_id INTEGER PRIMARY KEY)"
+        )
         try database.execute(
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS passages_fts USING fts5(
@@ -631,6 +961,10 @@ actor ManifestStore {
         let rows = try database.query("SELECT id FROM passages WHERE source_id = ?", bindings: [.text(sourceID)])
         for row in rows {
             if let id = row["id"]?.int64 {
+                try database.execute(
+                    "INSERT OR IGNORE INTO semantic_tombstones(passage_id) VALUES(?)",
+                    bindings: [.integer(id)]
+                )
                 try database.execute("DELETE FROM passages_fts WHERE rowid = ?", bindings: [.integer(id)])
             }
         }

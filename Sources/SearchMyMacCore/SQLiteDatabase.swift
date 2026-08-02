@@ -155,6 +155,11 @@ enum SQLiteValue: Sendable, Equatable {
         default: nil
         }
     }
+
+    var blobData: Data? {
+        if case .blob(let value) = self { return value }
+        return nil
+    }
 }
 
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)

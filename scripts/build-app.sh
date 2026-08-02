@@ -32,12 +32,32 @@ BIN_PATH="$(CLANG_MODULE_CACHE_PATH="$BUILD_ROOT/clang-cache" swift build -c "$B
 cargo build --locked --release --manifest-path "$PROJECT_ROOT/rust-engine/Cargo.toml"
 
 rm -rf "$APP_ROOT"
-mkdir -p "$APP_ROOT/Contents/MacOS" "$APP_ROOT/Contents/Resources" "$XPC_ROOT/Contents/MacOS" "$XPC_ROOT/Contents/Frameworks"
+mkdir -p "$APP_ROOT/Contents/MacOS" "$APP_ROOT/Contents/Resources" "$APP_ROOT/Contents/Frameworks" "$XPC_ROOT/Contents/MacOS" "$XPC_ROOT/Contents/Frameworks"
 cp "$PROJECT_ROOT/Resources/App/Info.plist" "$APP_ROOT/Contents/Info.plist"
+cp "$PROJECT_ROOT/Resources/App/AppIcon.icns" "$APP_ROOT/Contents/Resources/AppIcon.icns"
 cp "$PROJECT_ROOT/Resources/EngineXPC/Info.plist" "$XPC_ROOT/Contents/Info.plist"
 cp "$BIN_PATH/SearchMyMac" "$APP_ROOT/Contents/MacOS/SearchMyMac"
 cp "$BIN_PATH/SearchMyMacEngineService" "$XPC_ROOT/Contents/MacOS/SearchMyMacEngineService"
 cp "$PROJECT_ROOT/rust-engine/target/release/libsearchmymac_engine.dylib" "$XPC_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
+if [[ ! -d "$BIN_PATH/llama.framework" ]]; then
+  echo "SwiftPM did not stage llama.framework beside the built executables." >&2
+  exit 1
+fi
+cp -R "$BIN_PATH/llama.framework" "$APP_ROOT/Contents/Frameworks/llama.framework"
+cp -R "$BIN_PATH/llama.framework" "$XPC_ROOT/Contents/Frameworks/llama.framework"
+
+# SwiftPM's executable products only carry @loader_path by default. Bundled
+# frameworks live one level above MacOS, so add the standard app-bundle rpath
+# before signing or dyld will abort before main() is reached.
+for EXECUTABLE in \
+  "$APP_ROOT/Contents/MacOS/SearchMyMac" \
+  "$XPC_ROOT/Contents/MacOS/SearchMyMacEngineService"; do
+  install_name_tool -add_rpath "@executable_path/../Frameworks" "$EXECUTABLE"
+  if ! otool -l "$EXECUTABLE" | grep -Fq "path @executable_path/../Frameworks"; then
+    echo "Required bundled-framework rpath is missing from $EXECUTABLE" >&2
+    exit 1
+  fi
+done
 
 if [[ -n "$TEAM_IDENTIFIER" ]]; then
   CLIENT_REQUIREMENT="anchor apple generic and certificate leaf[subject.OU] = \"$TEAM_IDENTIFIER\" and identifier \"com.searchmymac.app\""
@@ -75,6 +95,8 @@ fi
 /usr/libexec/PlistBuddy -c "Set :SMMEngineSigningRequirement $ENGINE_REQUIREMENT" "$APP_ROOT/Contents/Info.plist"
 
 codesign --force --sign "$SIGNING_IDENTITY" "$XPC_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
+codesign --force --sign "$SIGNING_IDENTITY" "$APP_ROOT/Contents/Frameworks/llama.framework"
+codesign --force --sign "$SIGNING_IDENTITY" "$XPC_ROOT/Contents/Frameworks/llama.framework"
 codesign --force --sign "$SIGNING_IDENTITY" --entitlements "$ENGINE_ENTITLEMENTS" "$XPC_ROOT"
 codesign --force --sign "$SIGNING_IDENTITY" --entitlements "$APP_ENTITLEMENTS" "$APP_ROOT"
 

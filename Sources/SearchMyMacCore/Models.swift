@@ -6,6 +6,54 @@ public enum SearchMode: String, Codable, CaseIterable, Sendable {
     case hybrid
 }
 
+public enum SemanticPhase: String, Codable, Sendable {
+    case notInstalled
+    case downloading
+    case loading
+    case indexing
+    case ready
+    case paused
+    case failed
+}
+
+public struct SemanticStatus: Codable, Equatable, Sendable {
+    public var phase: SemanticPhase
+    public var modelID: String
+    public var modelDisplayName: String
+    public var modelBytes: Int64
+    public var downloadFraction: Double?
+    public var embeddedPassages: Int
+    public var totalPassages: Int
+    public var currentActivity: String?
+    public var error: String?
+
+    public init(
+        phase: SemanticPhase = .notInstalled,
+        modelID: String = "qwen3-embedding-0.6b-q8",
+        modelDisplayName: String = "Qwen3 Embedding 0.6B (Q8)",
+        modelBytes: Int64 = 639_150_592,
+        downloadFraction: Double? = nil,
+        embeddedPassages: Int = 0,
+        totalPassages: Int = 0,
+        currentActivity: String? = nil,
+        error: String? = nil
+    ) {
+        self.phase = phase
+        self.modelID = modelID
+        self.modelDisplayName = modelDisplayName
+        self.modelBytes = modelBytes
+        self.downloadFraction = downloadFraction
+        self.embeddedPassages = embeddedPassages
+        self.totalPassages = totalPassages
+        self.currentActivity = currentActivity
+        self.error = error
+    }
+
+    public var isSearchReady: Bool {
+        embeddedPassages > 0 && [.indexing, .ready, .paused].contains(phase)
+    }
+}
+
 public enum ContentAvailability: String, Codable, Sendable {
     case available
     case filenameOnly
@@ -311,5 +359,41 @@ public struct IndexHealth: Codable, Equatable, Sendable {
         self.inaccessibleLocationCount = inaccessibleLocationCount
         self.databaseBytes = databaseBytes
         self.generation = generation
+    }
+}
+
+public struct IndexingPreferences: Codable, Equatable, Sendable {
+    public var excludeSourceCode: Bool
+    public var excludedFolderPaths: Set<String>
+
+    public init(excludeSourceCode: Bool = false, excludedFolderPaths: Set<String> = []) {
+        self.excludeSourceCode = excludeSourceCode
+        self.excludedFolderPaths = excludedFolderPaths
+    }
+}
+
+public struct IndexFolderUsage: Identifiable, Codable, Equatable, Sendable {
+    public var id: String { path }
+    public var rootID: String
+    public var path: String
+    public var displayName: String
+    public var fileCount: Int
+    public var passageCount: Int
+    public var indexedTextBytes: Int64
+
+    public init(
+        rootID: String,
+        path: String,
+        displayName: String,
+        fileCount: Int,
+        passageCount: Int,
+        indexedTextBytes: Int64
+    ) {
+        self.rootID = rootID
+        self.path = path
+        self.displayName = displayName
+        self.fileCount = fileCount
+        self.passageCount = passageCount
+        self.indexedTextBytes = indexedTextBytes
     }
 }

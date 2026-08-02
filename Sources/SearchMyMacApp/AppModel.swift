@@ -22,12 +22,19 @@ final class AppModel: ObservableObject {
     @Published var indexingRate: Double = 0
     @Published var launchAtLogin = false
     @Published var historyRecordingEnabled = true
+    @Published var semanticStatus = SemanticStatus()
+    @Published var hasLoadedInitialState = false
+    @Published var indexingPreferences = IndexingPreferences()
+    @Published var folderUsage: [IndexFolderUsage] = []
+    @Published var isUpdatingIndexRules = false
+    @Published var isCompactingIndex = false
 
     private let engine: LocalSearchEngine?
     private var searchTask: Task<Void, Never>?
     private var indexTask: Task<Void, Never>?
     private var progressTask: Task<Void, Never>?
     private var reconciliationTask: Task<Void, Never>?
+    private var semanticProgressTask: Task<Void, Never>?
     private var cancellables: Set<AnyCancellable> = []
     private var indexingWorkActive = false
     private var indexOperationID: UUID?
@@ -46,6 +53,9 @@ final class AppModel: ObservableObject {
             await engine?.setApplicationIsActive(NSApplication.shared.isActive)
             await engine?.setHistoryRecording(historyRecordingEnabled)
             await refreshAll()
+            hasLoadedInitialState = true
+            do { try await engine?.resumeSemanticIndexing() }
+            catch { errorMessage = error.localizedDescription }
             if !roots.isEmpty { await reconcileRoots() }
             do { try await engine?.startMonitoring() }
             catch { errorMessage = error.localizedDescription }
@@ -64,6 +74,14 @@ final class AppModel: ObservableObject {
                 try? await Task.sleep(for: .seconds(86_400))
                 guard !Task.isCancelled else { return }
                 await self?.reconcileRoots()
+            }
+        }
+        semanticProgressTask = Task { [weak self] in
+            while !Task.isCancelled {
+                if let engine = self?.engine {
+                    self?.semanticStatus = await engine.semanticStatus()
+                }
+                try? await Task.sleep(for: .seconds(1))
             }
         }
     }
@@ -176,6 +194,86 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func setExcludeSourceCode(_ excluded: Bool) {
+        var updated = indexingPreferences
+        updated.excludeSourceCode = excluded
+        applyIndexingPreferences(updated, rescanAfterward: !excluded)
+    }
+
+    func excludeFolder(_ path: String) {
+        var updated = indexingPreferences
+        updated.excludedFolderPaths.insert(URL(fileURLWithPath: path).standardizedFileURL.path)
+        applyIndexingPreferences(updated, rescanAfterward: false)
+    }
+
+    func includeFolder(_ path: String) {
+        var updated = indexingPreferences
+        updated.excludedFolderPaths.remove(URL(fileURLWithPath: path).standardizedFileURL.path)
+        applyIndexingPreferences(updated, rescanAfterward: true)
+    }
+
+    func chooseFolderToExclude() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Exclude Folder"
+        panel.message = "This folder's existing search data will be removed and future changes will be ignored."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        excludeFolder(url.path)
+    }
+
+    func compactIndex() {
+        guard let engine, !isCompactingIndex else { return }
+        isCompactingIndex = true
+        Task {
+            defer { isCompactingIndex = false }
+            do {
+                try await engine.compactIndex()
+                await refreshIndexManagement()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func refreshIndexManagement() async {
+        guard let engine else { return }
+        do {
+            async let preferencesValue = engine.indexingPreferences()
+            async let usageValue = engine.folderUsage(limit: 20)
+            async let healthValue = engine.health()
+            indexingPreferences = try await preferencesValue
+            folderUsage = try await usageValue
+            health = try await healthValue
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func applyIndexingPreferences(_ preferences: IndexingPreferences, rescanAfterward: Bool) {
+        guard let engine, !isUpdatingIndexRules else { return }
+        indexingPreferences = preferences
+        isUpdatingIndexRules = true
+        let previousIndexTask = indexTask
+        previousIndexTask?.cancel()
+        Task {
+            defer { isUpdatingIndexRules = false }
+            do {
+                await previousIndexTask?.value
+                try await engine.updateIndexingPreferences(preferences)
+                await refreshIndexManagement()
+                if rescanAfterward {
+                    let availableRoots = roots.filter { $0.isEnabled && $0.isAvailable }
+                    beginIndexing(availableRoots, initialActivity: "Applying indexing preferences…")
+                }
+            } catch {
+                indexingPreferences = (try? await engine.indexingPreferences()) ?? indexingPreferences
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
     func saveCurrentSearch() {
         guard let engine, !query.isEmpty else { return }
         let saved = SavedSearch(name: query, request: SearchRequest(query: query, mode: mode, filters: filters))
@@ -207,6 +305,42 @@ final class AppModel: ObservableObject {
         Task { await engine?.setHistoryRecording(enabled) }
     }
 
+    func installSemanticModel() {
+        guard let engine else { return }
+        Task {
+            do { try await engine.installSemanticModel() }
+            catch { errorMessage = error.localizedDescription }
+            semanticStatus = await engine.semanticStatus()
+        }
+    }
+
+    func pauseSemanticIndexing() {
+        guard let engine else { return }
+        Task {
+            await engine.pauseSemanticIndexing()
+            semanticStatus = await engine.semanticStatus()
+        }
+    }
+
+    func resumeSemanticIndexing() {
+        guard let engine else { return }
+        Task {
+            do { try await engine.resumeSemanticIndexing() }
+            catch { errorMessage = error.localizedDescription }
+            semanticStatus = await engine.semanticStatus()
+        }
+    }
+
+    func removeSemanticModel() {
+        guard let engine else { return }
+        Task {
+            do { try await engine.removeSemanticModel() }
+            catch { errorMessage = error.localizedDescription }
+            semanticStatus = await engine.semanticStatus()
+            if mode != .text { scheduleSearch() }
+        }
+    }
+
     func open(_ hit: SearchHit) { NSWorkspace.shared.open(hit.url) }
 
     func quickLook(_ hit: SearchHit) { QuickLookController.shared.show(hit.url) }
@@ -233,11 +367,14 @@ final class AppModel: ObservableObject {
             async let historyValue = engine.history(limit: 100)
             async let savedValue = engine.savedSearches()
             async let healthValue = engine.health()
+            async let preferencesValue = engine.indexingPreferences()
             roots = try await rootsValue
             history = try await historyValue
             savedSearches = try await savedValue
             health = try await healthValue
+            indexingPreferences = try await preferencesValue
             progress = await engine.progress()
+            semanticStatus = await engine.semanticStatus()
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -257,8 +394,14 @@ final class AppModel: ObservableObject {
         progressTask?.cancel()
         progressTask = Task {
             guard let engine else { return }
+            var healthPoll = 0
             while !Task.isCancelled {
                 updateProgress(await engine.progress())
+                semanticStatus = await engine.semanticStatus()
+                if healthPoll.isMultiple(of: 3), let liveHealth = try? await engine.health() {
+                    health = liveHealth
+                }
+                healthPoll += 1
                 if !indexingWorkActive && (progress.phase == .idle || progress.phase == .failed) { break }
                 try? await Task.sleep(for: .milliseconds(350))
             }

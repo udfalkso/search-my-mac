@@ -37,41 +37,136 @@ public struct DiscoverySummary: Sendable, Equatable {
 }
 
 public struct DiscoveryPolicy: Sendable {
+    /// Increment whenever an exclusion changes so existing indexes are cleaned
+    /// immediately instead of retaining old-policy records until a full scan ends.
+    public static let version = 1
+
     public var excludedDirectoryNames: Set<String>
     public var excludedPathComponents: Set<String>
     public var excludedPathPrefixes: Set<String>
+    public var excludedRelativePathSequences: [[String]]
+    public var managedHomeDirectory: URL
+    public var allowedHomeLibraryDirectories: Set<String>
     public var contentExtensions: Set<String>
+    public var excludeSourceCode: Bool
+    public var sourceCodeExtensions: Set<String>
 
     public init(
         excludedDirectoryNames: Set<String> = [
             ".git", ".svn", ".hg", ".Trash", ".ssh", ".gnupg",
-            "node_modules", "DerivedData", "Pods", "Carthage", ".build",
-            "Caches", "Cache", "tmp", "Temp"
+            "node_modules", "bower_components", "jspm_packages",
+            "DerivedData", "Pods", "Carthage", ".build", ".swiftpm",
+            ".dart_tool", ".gradle", ".next", ".nuxt", ".turbo",
+            "__pycache__", ".pytest_cache", ".mypy_cache", ".tox", ".venv",
+            "venv", "site-packages", "Caches", "Cache", "tmp", "Temp"
         ],
         excludedPathComponents: Set<String> = ["Keychains"],
         excludedPathPrefixes: Set<String> = [
             FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
                 .first?.appendingPathComponent("Search My Mac").standardizedFileURL.path ?? ""
         ],
-        contentExtensions: Set<String> = DocumentExtractor.supportedExtensions
+        excludedRelativePathSequences: [[String]] = [
+            ["go", "pkg", "mod"],
+            ["vendor", "bundle"]
+        ],
+        managedHomeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        allowedHomeLibraryDirectories: Set<String> = ["CloudStorage", "Mobile Documents"],
+        contentExtensions: Set<String> = DocumentExtractor.supportedExtensions,
+        excludeSourceCode: Bool = false,
+        sourceCodeExtensions: Set<String> = [
+            "swift", "m", "mm", "h", "hpp", "c", "cc", "cpp", "rs", "go",
+            "py", "rb", "js", "jsx", "ts", "tsx", "java", "kt", "kts",
+            "php", "cs", "fs", "fsx", "vb", "scala", "sc", "lua", "r", "dart",
+            "ex", "exs", "erl", "hrl", "clj", "cljs", "cljc", "groovy", "gradle",
+            "vue", "svelte", "zig", "sol", "asm", "s", "pl", "pm",
+            "sh", "bash", "zsh", "fish", "sql", "css", "scss", "less"
+        ]
     ) {
-        self.excludedDirectoryNames = excludedDirectoryNames
-        self.excludedPathComponents = excludedPathComponents
+        self.excludedDirectoryNames = Set(excludedDirectoryNames.map(Self.normalizedComponent))
+        self.excludedPathComponents = Set(excludedPathComponents.map(Self.normalizedComponent))
         self.excludedPathPrefixes = excludedPathPrefixes.filter { !$0.isEmpty }
+        self.excludedRelativePathSequences = excludedRelativePathSequences.map { $0.map(Self.normalizedComponent) }
+        self.managedHomeDirectory = managedHomeDirectory.standardizedFileURL
+        self.allowedHomeLibraryDirectories = Set(allowedHomeLibraryDirectories.map(Self.normalizedComponent))
         self.contentExtensions = contentExtensions
+        self.excludeSourceCode = excludeSourceCode
+        self.sourceCodeExtensions = Set(sourceCodeExtensions.map(Self.normalizedComponent))
     }
 
-    func shouldDescend(into url: URL, values: URLResourceValues) -> Bool {
+    func shouldDescend(into url: URL, under rootURL: URL, values: URLResourceValues) -> Bool {
         if values.isSymbolicLink == true { return false }
-        if excludedDirectoryNames.contains(url.lastPathComponent) { return false }
-        if url.pathComponents.contains(where: excludedPathComponents.contains) { return false }
-        if excludedPathPrefixes.contains(where: { url.standardizedFileURL.path.hasPrefix($0 + "/") || url.standardizedFileURL.path == $0 }) {
-            return false
+        if values.isPackage == true { return false }
+        return !isExcluded(url, under: rootURL, leafIsDirectory: true)
+    }
+
+    func shouldIndex(_ url: URL, under rootURL: URL, values: URLResourceValues) -> Bool {
+        guard values.isSymbolicLink != true else { return false }
+        return !isExcluded(url, under: rootURL, leafIsDirectory: values.isDirectory == true)
+    }
+
+    func excludesIndexedFile(_ url: URL, under rootURL: URL) -> Bool {
+        isExcluded(url, under: rootURL, leafIsDirectory: false)
+    }
+
+    private func isExcluded(_ url: URL, under rootURL: URL, leafIsDirectory: Bool) -> Bool {
+        let standardizedURL = url.standardizedFileURL
+        if excludedPathPrefixes.contains(where: { Self.path(standardizedURL.path, isWithin: $0) }) {
+            return true
         }
-        if values.isPackage == true {
-            return false
+
+        guard let relativeComponents = Self.relativeComponents(of: standardizedURL, under: rootURL) else {
+            return true
         }
-        return true
+        let normalized = relativeComponents.map(Self.normalizedComponent)
+        let directoryComponents = leafIsDirectory ? normalized : Array(normalized.dropLast())
+
+        if !leafIsDirectory, excludeSourceCode,
+           sourceCodeExtensions.contains(Self.normalizedComponent(standardizedURL.pathExtension)) {
+            return true
+        }
+
+        if directoryComponents.contains(where: excludedDirectoryNames.contains) { return true }
+        if directoryComponents.contains(where: excludedPathComponents.contains) { return true }
+        if excludedRelativePathSequences.contains(where: { Self.contains($0, in: directoryComponents) }) {
+            return true
+        }
+
+        // An Entire Home scan treats ~/Library as a traversal corridor only for
+        // user-facing cloud document locations. Choosing a folder inside Library
+        // explicitly makes that folder the root and therefore opts it back in.
+        if rootURL.standardizedFileURL.path == managedHomeDirectory.path,
+           directoryComponents.first == "library" {
+            if leafIsDirectory, directoryComponents.count == 1 { return false }
+            guard directoryComponents.count >= 2,
+                  allowedHomeLibraryDirectories.contains(directoryComponents[1]) else { return true }
+        }
+        return false
+    }
+
+    private static func relativeComponents(of url: URL, under rootURL: URL) -> [String]? {
+        let candidate = url.standardizedFileURL.pathComponents
+        let root = rootURL.standardizedFileURL.pathComponents
+        guard candidate.count >= root.count,
+              zip(candidate.prefix(root.count), root).allSatisfy({ $0 == $1 }) else { return nil }
+        return Array(candidate.dropFirst(root.count))
+    }
+
+    private static func normalizedComponent(_ component: String) -> String {
+        let locale = Locale(identifier: "en_US_POSIX")
+        return component.folding(options: [.caseInsensitive, .widthInsensitive], locale: locale)
+            .lowercased(with: locale)
+    }
+
+    private static func path(_ candidate: String, isWithin prefix: String) -> Bool {
+        candidate == prefix || candidate.hasPrefix(prefix.hasSuffix("/") ? prefix : prefix + "/")
+    }
+
+    private static func contains(_ sequence: [String], in components: [String]) -> Bool {
+        guard !sequence.isEmpty, sequence.count <= components.count else { return false }
+        for start in 0...(components.count - sequence.count) {
+            if Array(components[start..<(start + sequence.count)]) == sequence { return true }
+        }
+        return false
     }
 }
 
@@ -138,13 +233,16 @@ public struct FileDiscovery: Sendable {
             }
 
             if values.isDirectory == true {
-                if values.isPackage == true, policy.contentExtensions.contains(url.pathExtension.lowercased()) {
+                if values.isPackage == true,
+                   policy.contentExtensions.contains(url.pathExtension.lowercased()),
+                   policy.shouldIndex(url, under: root.url, values: values) {
                     try append(makeDiscoveredFile(root: root, url: url, values: values))
                 }
-                if !policy.shouldDescend(into: url, values: values) { enumerator.skipDescendants() }
+                if !policy.shouldDescend(into: url, under: root.url, values: values) { enumerator.skipDescendants() }
                 continue
             }
-            guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+            guard values.isRegularFile == true,
+                  policy.shouldIndex(url, under: root.url, values: values) else { continue }
             try append(makeDiscoveredFile(root: root, url: url, values: values))
         }
         if !batch.isEmpty { try onBatch(batch) }
@@ -159,7 +257,7 @@ public struct FileDiscovery: Sendable {
             .volumeIdentifierKey, .fileResourceIdentifierKey
         ]
         guard let values = try? url.resourceValues(forKeys: keys),
-              values.isSymbolicLink != true else { return nil }
+              policy.shouldIndex(url, under: root.url, values: values) else { return nil }
         if values.isDirectory == true {
             guard values.isPackage == true,
                   policy.contentExtensions.contains(url.pathExtension.lowercased()) else { return nil }

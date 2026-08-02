@@ -14,7 +14,9 @@ SQLite is authoritative. It stores roots, file identity and availability, desire
 
 Initial discovery writes prioritized bounded batches to `scan_items`, while a consumer immediately extracts and indexes unprocessed staged rows. The discovery-phase progress bar measures the share of files found so far that have already been indexed; because the denominator is still growing, it is explicitly labeled “live.” Once enumeration completes, the denominator freezes and the percentage becomes exact. Deletion reconciliation still happens only after a successful complete scan of an available root. A cancelled or failed scan discards its staging generation and does not infer deletion.
 
-The vector store appends canonical float16 payloads and records offsets and SHA-256 checksums in an atomically replaced manifest. Published HNSW generations will remain immutable. Queries will merge that generation with exact results from the durable delta; publication uses temporary files, validation, and atomic rename.
+The semantic pipeline uses the official Qwen3 Embedding 0.6B Q8 GGUF through a pinned universal llama.cpp framework. The app validates the optional model download by exact size and SHA-256 before loading it. Documents are embedded without an instruction; queries use Qwen's retrieval instruction format. Both outputs are normalized 1024-dimensional vectors.
+
+The vector store appends canonical float16 payloads and journals offsets, SHA-256 checksums, and tombstones. Published USearch HNSW generations are immutable, memory-mapped, and int8-quantized. Queries merge approximate snapshot results with exact results from the durable delta; publication uses a temporary file, count validation, and atomic manifest replacement. SQLite records passage/model completion and deletion tombstones, so interrupted work is replayable.
 
 ## Search
 

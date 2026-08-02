@@ -31,6 +31,7 @@ public struct VectorMatch: Sendable, Equatable {
 public actor FlatVectorStore {
     private let dataURL: URL
     private let manifestURL: URL
+    private let journalURL: URL
     private var records: [UInt64: StoredVector] = [:]
 
     public init(directory: URL) throws {
@@ -41,12 +42,23 @@ public actor FlatVectorStore {
         )
         dataURL = directory.appendingPathComponent("vectors.f16")
         manifestURL = directory.appendingPathComponent("vectors.json")
+        journalURL = directory.appendingPathComponent("vectors.manifest.jsonl")
         if !FileManager.default.fileExists(atPath: dataURL.path) {
             _ = FileManager.default.createFile(atPath: dataURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
         }
         if let data = try? Data(contentsOf: manifestURL) {
             let decoded = try JSONDecoder().decode([StoredVector].self, from: data)
             records = Dictionary(uniqueKeysWithValues: decoded.map { ($0.key, $0) })
+        }
+        if let journal = try? String(contentsOf: journalURL, encoding: .utf8) {
+            for line in journal.split(separator: "\n") {
+                guard let data = line.data(using: .utf8),
+                      let record = try? JSONDecoder().decode(StoredVector.self, from: data) else { continue }
+                records[record.key] = record
+            }
+        }
+        if !FileManager.default.fileExists(atPath: journalURL.path) {
+            _ = FileManager.default.createFile(atPath: journalURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
         }
     }
 
@@ -64,7 +76,7 @@ public actor FlatVectorStore {
         try handle.synchronize()
         let record = StoredVector(key: key, offset: offset, dimensions: vector.count, checksum: checksum)
         records[key] = record
-        try persistManifest()
+        try appendManifestRecord(record)
         return record
     }
 
@@ -72,6 +84,10 @@ public actor FlatVectorStore {
         guard let record = records[key], !record.tombstoned else { return nil }
         let handle = try FileHandle(forReadingFrom: dataURL)
         defer { try? handle.close() }
+        return try vector(for: record, handle: handle)
+    }
+
+    private func vector(for record: StoredVector, handle: FileHandle) throws -> [Float]? {
         try handle.seek(toOffset: record.offset)
         let byteCount = record.dimensions * MemoryLayout<UInt16>.size
         guard let data = try handle.read(upToCount: byteCount), data.count == byteCount else { return nil }
@@ -87,7 +103,20 @@ public actor FlatVectorStore {
         guard var record = records[key] else { return }
         record.tombstoned = true
         records[key] = record
-        try persistManifest()
+        try appendManifestRecord(record)
+    }
+
+    public func isActive(key: UInt64) -> Bool {
+        records[key]?.tombstoned == false
+    }
+
+    public func clear() throws {
+        records.removeAll()
+        try Data().write(to: dataURL, options: [.atomic])
+        try Data().write(to: journalURL, options: [.atomic])
+        try? FileManager.default.removeItem(at: manifestURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dataURL.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: journalURL.path)
     }
 
     public func activeRecords() -> [StoredVector] {
@@ -111,8 +140,10 @@ public actor FlatVectorStore {
         let queryNorm = sqrt(query.reduce(0) { $0 + $1 * $1 })
         guard queryNorm > 0 else { return [] }
         var matches: [VectorMatch] = []
+        let handle = try FileHandle(forReadingFrom: dataURL)
+        defer { try? handle.close() }
         for record in records.values where !record.tombstoned && !snapshotKeys.contains(record.key) && record.dimensions == query.count {
-            guard let vector = try vector(for: record.key) else { continue }
+            guard let vector = try vector(for: record, handle: handle) else { continue }
             var dot: Float = 0
             var norm: Float = 0
             for index in vector.indices {
@@ -125,14 +156,13 @@ public actor FlatVectorStore {
         return matches.sorted { $0.score > $1.score }.prefix(limit).map { $0 }
     }
 
-    private func persistManifest() throws {
-        let data = try JSONEncoder().encode(records.values.sorted { $0.key < $1.key })
-        let temporary = manifestURL.appendingPathExtension("new")
-        try data.write(to: temporary, options: [.atomic])
-        if FileManager.default.fileExists(atPath: manifestURL.path) {
-            _ = try FileManager.default.replaceItemAt(manifestURL, withItemAt: temporary)
-        } else {
-            try FileManager.default.moveItem(at: temporary, to: manifestURL)
-        }
+    private func appendManifestRecord(_ record: StoredVector) throws {
+        var data = try JSONEncoder().encode(record)
+        data.append(0x0A)
+        let handle = try FileHandle(forUpdating: journalURL)
+        defer { try? handle.close() }
+        _ = try handle.seekToEnd()
+        try handle.write(contentsOf: data)
+        try handle.synchronize()
     }
 }

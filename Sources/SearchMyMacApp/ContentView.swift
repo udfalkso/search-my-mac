@@ -16,7 +16,9 @@ struct ContentView: View {
                 } else {
                     SearchToolbar()
                     Divider()
-                    if model.roots.isEmpty {
+                    if !model.hasLoadedInitialState {
+                        InitialLoadingView()
+                    } else if model.roots.isEmpty {
                         OnboardingView()
                     } else if model.query.isEmpty {
                         EmptySearchView()
@@ -40,6 +42,20 @@ struct ContentView: View {
     }
 }
 
+private struct InitialLoadingView: View {
+    var body: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Opening your index…")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+    }
+}
+
 private struct IndexHealthView: View {
     @EnvironmentObject private var model: AppModel
 
@@ -48,12 +64,129 @@ private struct IndexHealthView: View {
             VStack(alignment: .leading, spacing: 22) {
                 Text("Index Health").font(.largeTitle.bold())
                 HStack(spacing: 14) {
-                    HealthCard(title: "Files", value: model.health.fileCount.formatted(), symbol: "doc.on.doc")
-                    HealthCard(title: "Passages", value: model.health.passageCount.formatted(), symbol: "text.alignleft")
+                    HealthCard(title: "Indexed files", value: model.health.fileCount.formatted(), symbol: "doc.on.doc")
+                    HealthCard(title: "Searchable passages", value: model.health.passageCount.formatted(), symbol: "text.alignleft")
                     HealthCard(title: "Needs attention", value: model.health.failedCount.formatted(), symbol: "exclamationmark.triangle")
                     HealthCard(title: "Coverage gaps", value: model.health.inaccessibleLocationCount.formatted(), symbol: "lock.trianglebadge.exclamationmark")
                     HealthCard(title: "Storage", value: ByteCountFormatter.string(fromByteCount: model.health.databaseBytes, countStyle: .file), symbol: "internaldrive")
                 }
+                Text("These are live totals in the searchable index. The bottom status bar separately reports progress through the current discovery or reconciliation run.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 12) {
+                    Image(systemName: "brain").foregroundStyle(.tint)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Semantic coverage").font(.headline)
+                        Text(semanticCoverageText).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    SemanticSettingsShortcut()
+                }
+                .padding().background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
+
+                Text("Control Index Size").font(.title2.bold())
+                VStack(alignment: .leading, spacing: 16) {
+                    Toggle(isOn: Binding(
+                        get: { model.indexingPreferences.excludeSourceCode },
+                        set: { model.setExcludeSourceCode($0) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Exclude source code").font(.headline)
+                            Text("Skips common programming-language files in every indexed location, including Swift, JavaScript, Python, Go, Rust, and similar formats.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .disabled(model.isUpdatingIndexRules)
+
+                    Divider()
+
+                    HStack(spacing: 10) {
+                        Button("Choose Folder to Exclude…") { model.chooseFolderToExclude() }
+                            .disabled(model.isUpdatingIndexRules)
+                        Button(model.isCompactingIndex ? "Reclaiming Space…" : "Reclaim Unused Space") {
+                            model.compactIndex()
+                        }
+                        .disabled(model.isCompactingIndex || model.progress.phase != .idle)
+                        Spacer()
+                        if model.isUpdatingIndexRules || model.isCompactingIndex {
+                            ProgressView().controlSize(.small)
+                        }
+                    }
+
+                    Text("Excluding files removes them from search immediately. Database files may not shrink until unused space is reclaimed; compaction requires indexing to be idle and temporary free disk space.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(18)
+                .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+
+                if !model.indexingPreferences.excludedFolderPaths.isEmpty {
+                    Text("Excluded Folders").font(.title2.bold())
+                    VStack(spacing: 0) {
+                        ForEach(model.indexingPreferences.excludedFolderPaths.sorted(), id: \.self) { path in
+                            HStack(spacing: 12) {
+                                Image(systemName: "folder.badge.minus").foregroundStyle(.secondary)
+                                Text(path)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .help(path)
+                                Spacer()
+                                Button("Include Again") { model.includeFolder(path) }
+                                    .disabled(model.isUpdatingIndexRules)
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 12)
+                            if path != model.indexingPreferences.excludedFolderPaths.sorted().last {
+                                Divider().padding(.leading, 48)
+                            }
+                        }
+                    }
+                    .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+                }
+
+                HStack {
+                    Text("Largest Indexed Folders").font(.title2.bold())
+                    Spacer()
+                    Button {
+                        Task { await model.refreshIndexManagement() }
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                }
+                Text("Ranked by retained document text. This is the best folder-level measure of relative index impact; SQLite and full-text-search overhead cannot be attributed exactly to individual folders.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if model.folderUsage.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "chart.bar.doc.horizontal")
+                            .font(.system(size: 28))
+                            .foregroundStyle(.secondary)
+                        Text("No folder data yet").font(.headline)
+                        Text("Folder usage appears as documents are indexed.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 140)
+                    .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(Array(model.folderUsage.prefix(12).enumerated()), id: \.element.id) { offset, usage in
+                            FolderUsageRow(
+                                usage: usage,
+                                canExclude: canExclude(usage),
+                                isBusy: model.isUpdatingIndexRules,
+                                exclude: { model.excludeFolder(usage.path) }
+                            )
+                            if offset < min(model.folderUsage.count, 12) - 1 {
+                                Divider().padding(.leading, 48)
+                            }
+                        }
+                    }
+                    .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+                }
+
                 Text("Locations").font(.title2.bold())
                 ForEach(model.roots) { root in
                     HStack {
@@ -73,6 +206,63 @@ private struct IndexHealthView: View {
             }
             .padding(28)
         }
+        .task { await model.refreshIndexManagement() }
+    }
+
+    private var semanticCoverageText: String {
+        switch model.semanticStatus.phase {
+        case .notInstalled: "Not enabled"
+        case .downloading: "Downloading the local model"
+        case .loading: "Loading the local model"
+        case .failed: "Needs attention"
+        default:
+            "\(model.semanticStatus.embeddedPassages.formatted()) of \(model.semanticStatus.totalPassages.formatted()) passages embedded · \(model.semanticStatus.phase.rawValue.capitalized)"
+        }
+    }
+
+    private func canExclude(_ usage: IndexFolderUsage) -> Bool {
+        !model.roots.contains { root in
+            root.id == usage.rootID && root.url.standardizedFileURL.path == usage.path
+        }
+    }
+}
+
+private struct FolderUsageRow: View {
+    let usage: IndexFolderUsage
+    let canExclude: Bool
+    let isBusy: Bool
+    let exclude: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "folder.fill")
+                .foregroundStyle(.tint)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(usage.displayName).font(.headline)
+                Text(usage.path)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(usage.path)
+            }
+            Spacer(minLength: 20)
+            VStack(alignment: .trailing, spacing: 3) {
+                Text(ByteCountFormatter.string(fromByteCount: usage.indexedTextBytes, countStyle: .file))
+                    .font(.headline.monospacedDigit())
+                Text("\(usage.fileCount.formatted()) files · \(usage.passageCount.formatted()) passages")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(minWidth: 155, alignment: .trailing)
+            if canExclude {
+                Button("Exclude") { exclude() }
+                    .disabled(isBusy)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
     }
 }
 
@@ -102,6 +292,8 @@ enum SidebarSelection: Hashable {
 private struct SidebarView: View {
     @EnvironmentObject private var model: AppModel
     @Binding var selection: SidebarSelection?
+    @State private var isHistoryHeaderHovered = false
+    @State private var showsClearHistoryConfirmation = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -133,7 +325,7 @@ private struct SidebarView: View {
                     }
                 }
                 if !model.history.isEmpty {
-                    Section("History") {
+                    Section {
                         ForEach(model.history.prefix(15)) { entry in
                             Button {
                                 model.useHistory(entry)
@@ -143,6 +335,29 @@ private struct SidebarView: View {
                             }
                             .buttonStyle(.plain)
                             .tag(SidebarSelection.history(entry.id))
+                        }
+                    } header: {
+                        HStack {
+                            Text("History")
+                            Spacer()
+                            Button {
+                                showsClearHistoryConfirmation = true
+                            } label: {
+                                Image(systemName: "trash")
+                                    .frame(width: 20, height: 20)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help("Clear Search History")
+                            .accessibilityLabel("Clear Search History")
+                            .opacity(isHistoryHeaderHovered ? 1 : 0)
+                            .allowsHitTesting(isHistoryHeaderHovered)
+                            .accessibilityHidden(!isHistoryHeaderHovered)
+                        }
+                        .onHover { hovering in
+                            withAnimation(.easeOut(duration: 0.12)) {
+                                isHistoryHeaderHovered = hovering
+                            }
                         }
                     }
                 }
@@ -170,6 +385,16 @@ private struct SidebarView: View {
         }
         .navigationTitle("Search My Mac")
         .frame(minWidth: 220)
+        .confirmationDialog(
+            "Clear Search History?",
+            isPresented: $showsClearHistoryConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Clear History", role: .destructive) { model.clearHistory() }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This permanently removes every search from the History section.")
+        }
     }
 }
 
@@ -294,7 +519,7 @@ private struct SearchToolbar: View {
             }
             if model.mode != model.effectiveMode && !model.query.isEmpty {
                 HStack(spacing: 10) {
-                    Label("Semantic indexing is not set up; showing text-search results.", systemImage: "clock.badge")
+                    Label(semanticFallbackMessage, systemImage: "clock.badge")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -331,6 +556,23 @@ private struct SearchToolbar: View {
         model.filters.extensions.isEmpty
             ? "Filter by file type"
             : "Filtering by \(selectedFileTypesSummary)"
+    }
+
+    private var semanticFallbackMessage: String {
+        switch model.semanticStatus.phase {
+        case .notInstalled:
+            "Enable semantic search to use this mode; showing text results."
+        case .downloading, .loading:
+            "The semantic model is being prepared; showing text results."
+        case .indexing:
+            "Semantic indexing has not reached searchable passages yet; showing text results."
+        case .paused:
+            "Semantic indexing is paused; showing text results."
+        case .failed:
+            "Semantic search needs attention; showing text results."
+        case .ready:
+            "Semantic results are temporarily unavailable; showing text results."
+        }
     }
 
     private func setModifiedAfter(days: Int = 0, months: Int = 0, years: Int = 0) {
@@ -374,8 +616,9 @@ private struct ResultsView: View {
     var body: some View {
         List(selection: $model.selectedHitID) {
             ForEach(model.results) { hit in
-                ResultRow(hit: hit)
+                ResultRow(hit: hit, isSelected: model.selectedHitID == hit.id)
                     .tag(hit.id)
+                    .listRowBackground(model.selectedHitID == hit.id ? Color.accentColor : Color.clear)
                     .onTapGesture(count: 2) { model.open(hit) }
                     .contextMenu {
                         Button { model.quickLook(hit) } label: { Label("Quick Look", systemImage: "eye") }
@@ -410,38 +653,48 @@ private struct ResultRow: View {
     @EnvironmentObject private var model: AppModel
     @State private var isHovering = false
     let hit: SearchHit
+    let isSelected: Bool
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Image(nsImage: NSWorkspace.shared.icon(forFile: hit.path))
                 .resizable().frame(width: 38, height: 38)
             VStack(alignment: .leading, spacing: 5) {
-                HStack {
+                HStack(spacing: 8) {
                     Text(hit.filename).font(.headline).lineLimit(1)
                     AvailabilityBadge(availability: hit.availability)
                     Spacer()
-                    if let modified = hit.modifiedAt { Text(modified, style: .date).font(.caption).foregroundStyle(.secondary) }
-                    if isHovering {
-                        ResultHoverActions(hit: hit)
-                            .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .trailing)))
+                    if let modified = hit.modifiedAt {
+                        Text(modified, style: .date)
+                            .font(.caption)
+                            .foregroundStyle(secondaryColor)
                     }
+                    ResultHoverActions(hit: hit)
+                        .opacity(isHovering ? 1 : 0)
+                        .allowsHitTesting(isHovering)
+                        .accessibilityHidden(!isHovering)
                 }
                 Text(hit.url.deletingLastPathComponent().path)
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    .font(.caption).foregroundStyle(secondaryColor).lineLimit(1).truncationMode(.middle)
                 ForEach(hit.snippets.prefix(3)) { snippet in
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         if let label = snippet.locationLabel {
-                            Text(label).font(.caption2).foregroundStyle(.secondary).frame(minWidth: 42, alignment: .leading)
+                            Text(label).font(.caption2).foregroundStyle(secondaryColor).frame(minWidth: 42, alignment: .leading)
                         }
                         Text(highlighted(snippet)).font(.callout).lineLimit(3)
                     }
                 }
             }
         }
+        .foregroundStyle(isSelected ? Color.white : Color.primary)
         .padding(.vertical, 7)
         .onHover { hovering in
             withAnimation(.easeOut(duration: 0.12)) { isHovering = hovering }
         }
+    }
+
+    private var secondaryColor: Color {
+        isSelected ? Color.white.opacity(0.78) : Color.secondary
     }
 
     private func highlighted(_ snippet: SearchSnippet) -> AttributedString {
@@ -582,7 +835,8 @@ private struct OnboardingView: View {
                 Button("Index Entire Home") { model.indexEntireHome() }.buttonStyle(.borderedProminent).controlSize(.large)
                 Button("Choose a Folder…") { model.chooseAndIndexFolder() }.buttonStyle(.bordered).controlSize(.large)
             }
-            Text("System and sensitive credential folders are excluded by default.").font(.caption).foregroundStyle(.secondary)
+            Text("System folders, caches, dependencies, build output, and sensitive credentials are excluded by default.")
+                .font(.caption).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)
@@ -687,14 +941,11 @@ private struct IndexStatusBar: View {
     }
 
     private var trailingCountText: String {
-        if model.progress.phase == .idle {
-            return "\(model.health.fileCount.formatted()) searchable"
-        }
-        return "\(model.progress.completed.formatted()) indexed"
+        "\(model.health.fileCount.formatted()) searchable"
     }
 
     private var progressDetails: String {
         let queued = max(0, model.progress.discovered - model.progress.completed)
-        return "\(model.progress.discovered.formatted()) found • \(queued.formatted()) queued"
+        return "\(model.progress.completed.formatted()) checked this run • \(model.progress.discovered.formatted()) found so far • \(queued.formatted()) waiting"
     }
 }

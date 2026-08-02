@@ -20,12 +20,12 @@ The following items are deliberately tracked as release blockers rather than bei
 
 ## Semantic search
 
-- Ship and validate a compact Core ML conversion of `multilingual-e5-small` plus its exact tokenizer.
+- Validate the pinned Qwen3 Embedding 0.6B Q8 llama.cpp runtime and tokenizer against the official reference implementation on every supported Apple-silicon and Intel baseline.
 - Verify output parity on supported Apple silicon and Intel references.
-- Implement immutable, memory-mapped USearch generations and atomic validation/rollback.
+- Stress immutable, memory-mapped USearch generation publication, low-disk failure, corruption handling, and rollback under forced termination.
 - Quantize only if int8 recall@10 is within 2% of float16 on the judged corpus.
 - Implement weighted RRF over the top 200 candidates and lexical-priority rules for identifiers, filenames, rare proper nouns, and quoted phrases.
-- Add progressive semantic scheduling, honest ETA, pause/disable/reset, and semantic-completion health reporting.
+- Tune progressive semantic scheduling and add a calibrated ETA after collecting representative per-machine throughput data.
 
 ## Platform risk spike
 
