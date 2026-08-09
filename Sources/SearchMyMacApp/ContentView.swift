@@ -13,8 +13,68 @@ private enum AppVisualAssets {
     }()
 }
 
+/// A restrained visual signature derived from the cobalt light inside the app icon.
+/// It is intentionally used for discovery cues rather than replacing the user's
+/// system accent color on standard controls.
+private enum SearchMyMacTheme {
+    static let lensBlue = Color(red: 0.16, green: 0.43, blue: 0.98)
+    static let brightLensBlue = Color(red: 0.33, green: 0.58, blue: 1.0)
+    static let deepLensBlue = Color(red: 0.04, green: 0.24, blue: 0.68)
+
+    static func softSurface(for colorScheme: ColorScheme) -> Color {
+        colorScheme == .dark
+            ? brightLensBlue.opacity(0.10)
+            : lensBlue.opacity(0.065)
+    }
+
+    static func hairline(for colorScheme: ColorScheme) -> Color {
+        colorScheme == .dark
+            ? brightLensBlue.opacity(0.28)
+            : lensBlue.opacity(0.18)
+    }
+
+    static func windowWash(for colorScheme: ColorScheme) -> LinearGradient {
+        LinearGradient(
+            colors: colorScheme == .dark
+                ? [
+                    Color(red: 0.105, green: 0.180, blue: 0.230),
+                    Color(red: 0.070, green: 0.125, blue: 0.180)
+                ]
+                : [
+                    Color(red: 0.965, green: 0.977, blue: 1.000),
+                    Color(red: 0.938, green: 0.958, blue: 0.992)
+                ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+    }
+
+    static func sidebarWash(for colorScheme: ColorScheme) -> LinearGradient {
+        LinearGradient(
+            colors: colorScheme == .dark
+                ? [
+                    Color(red: 0.125, green: 0.210, blue: 0.260),
+                    Color(red: 0.080, green: 0.150, blue: 0.205)
+                ]
+                : [
+                    Color(red: 0.930, green: 0.953, blue: 0.995),
+                    Color(red: 0.902, green: 0.934, blue: 0.984)
+                ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+
+    static func windowBackgroundColor(for colorScheme: ColorScheme) -> NSColor {
+        colorScheme == .dark
+            ? NSColor(red: 0.085, green: 0.150, blue: 0.200, alpha: 1)
+            : NSColor(red: 0.949, green: 0.968, blue: 0.997, alpha: 1)
+    }
+}
+
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.colorScheme) private var colorScheme
     @State private var sidebarSelection: SidebarSelection? = .allFiles
 
     var body: some View {
@@ -24,6 +84,8 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 if sidebarSelection == .health {
                     IndexHealthView()
+                } else if sidebarSelection == .settings {
+                    SettingsView()
                 } else {
                     SearchToolbar()
                     Divider()
@@ -42,6 +104,10 @@ struct ContentView: View {
                     }
                 }
                 IndexStatusBar()
+            }
+            .background {
+                SearchMyMacTheme.windowWash(for: colorScheme)
+                    .ignoresSafeArea()
             }
         }
         .navigationTitle("")
@@ -65,6 +131,40 @@ struct ContentView: View {
         } message: {
             Text(model.errorMessage ?? "Unknown error")
         }
+        .onReceive(NotificationCenter.default.publisher(for: .showSearchMyMacSettings)) { notification in
+            if let tab = notification.object as? String {
+                UserDefaults.standard.set(tab, forKey: "settings.selectedTab")
+            }
+            withAnimation(.easeOut(duration: 0.18)) {
+                sidebarSelection = .settings
+            }
+        }
+        .background {
+            WindowTintInstaller(colorScheme: colorScheme)
+                .frame(width: 0, height: 0)
+        }
+    }
+}
+
+private struct WindowTintInstaller: NSViewRepresentable {
+    let colorScheme: ColorScheme
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        applyTint(to: view)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        applyTint(to: nsView)
+    }
+
+    private func applyTint(to view: NSView) {
+        let backgroundColor = SearchMyMacTheme.windowBackgroundColor(for: colorScheme)
+        DispatchQueue.main.async {
+            view.window?.backgroundColor = backgroundColor
+            view.window?.titlebarAppearsTransparent = true
+        }
     }
 }
 
@@ -80,8 +180,8 @@ private struct AppBrandLockup: View {
                 Text("Search")
                     .fontWeight(.semibold)
                 Text(" My Mac")
-                    .fontWeight(.medium)
-                    .foregroundStyle(.secondary)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(SearchMyMacTheme.lensBlue)
             }
             .font(.system(size: 15))
             .tracking(-0.15)
@@ -179,7 +279,7 @@ private struct IndexHealthView: View {
                     )) {
                         VStack(alignment: .leading, spacing: 3) {
                             Text("Exclude source code").font(.headline)
-                            Text("Skips common programming-language files in every indexed location, including Swift, JavaScript, Python, Go, Rust, and similar formats.")
+                            Text("Skips common programming-language and structured data files in every indexed location, including Swift, JavaScript, Python, Go, Rust, and JSON.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -545,6 +645,7 @@ private struct HealthCard: View {
 enum SidebarSelection: Hashable {
     case allFiles
     case health
+    case settings
     case history(String)
     case saved(String)
     case root(String)
@@ -552,6 +653,7 @@ enum SidebarSelection: Hashable {
 
 private struct SidebarView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.colorScheme) private var colorScheme
     @Binding var selection: SidebarSelection?
     @State private var isHistoryHeaderHovered = false
     @State private var showsClearHistoryConfirmation = false
@@ -567,10 +669,17 @@ private struct SidebarView: View {
                         selection = .allFiles
                         model.filters.rootIDs.removeAll()
                         model.filters.pathPrefixes.removeAll()
-                        model.scheduleSearch()
+                        model.scheduleSearch(clearingResults: true)
                     } label: {
                         Label("All Indexed Files", systemImage: "doc.text.magnifyingglass")
                             .fontWeight(.medium)
+                            .foregroundStyle(
+                                selection == .allFiles
+                                    ? (colorScheme == .dark
+                                        ? SearchMyMacTheme.brightLensBlue
+                                        : SearchMyMacTheme.deepLensBlue)
+                                    : Color.primary
+                            )
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .contentShape(Rectangle())
                     }
@@ -583,7 +692,7 @@ private struct SidebarView: View {
                                 selection = .root(root.id)
                                 model.filters.rootIDs = [root.id]
                                 model.filters.pathPrefixes.removeAll()
-                                model.scheduleSearch()
+                                model.scheduleSearch(clearingResults: true)
                             } label: {
                                 Label(
                                     root.displayName,
@@ -726,28 +835,39 @@ private struct SidebarView: View {
                 }
             }
             .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
             .padding(.top, 8)
 
             Divider()
 
-            Button {
-                selection = .health
-            } label: {
-                Label("Index Health", systemImage: "heart.text.square")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 12)
-                    .frame(height: 34)
-                    .foregroundStyle(selection == .health ? Color.white : Color.primary)
-                    .background(
-                        selection == .health ? Color.accentColor : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 7)
-                    )
+            VStack(spacing: 2) {
+                SidebarUtilityButton(
+                    title: "Index Health",
+                    symbol: "heart.text.square",
+                    isSelected: selection == .health,
+                    colorScheme: colorScheme,
+                    help: "View indexing coverage, storage, and errors"
+                ) {
+                    selection = .health
+                }
+
+                SidebarUtilityButton(
+                    title: "Settings",
+                    symbol: "gearshape",
+                    isSelected: selection == .settings,
+                    colorScheme: colorScheme,
+                    help: "Open Search My Mac settings"
+                ) {
+                    selection = .settings
+                }
             }
-            .buttonStyle(.plain)
             .padding(8)
-            .help("View indexing coverage, storage, and errors")
         }
         .frame(minWidth: 220)
+        .background {
+            SearchMyMacTheme.sidebarWash(for: colorScheme)
+                .ignoresSafeArea()
+        }
         .confirmationDialog(
             "Clear Search History?",
             isPresented: $showsClearHistoryConfirmation,
@@ -769,8 +889,42 @@ private struct SidebarView: View {
     }
 }
 
+private struct SidebarUtilityButton: View {
+    let title: String
+    let symbol: String
+    let isSelected: Bool
+    let colorScheme: ColorScheme
+    let help: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: symbol)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .frame(height: 34)
+                .foregroundStyle(
+                    isSelected
+                        ? (colorScheme == .dark
+                            ? SearchMyMacTheme.brightLensBlue
+                            : SearchMyMacTheme.deepLensBlue)
+                        : Color.primary
+                )
+                .background(
+                    isSelected
+                        ? SearchMyMacTheme.softSurface(for: colorScheme)
+                        : Color.clear,
+                    in: RoundedRectangle(cornerRadius: 7)
+                )
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+}
+
 private struct SearchToolbar: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.colorScheme) private var colorScheme
     @AppStorage("semanticTip.dismissedPhase") private var dismissedSemanticTipPhase = ""
     @FocusState private var focused: Bool
     @State private var showsFilters = false
@@ -779,6 +933,13 @@ private struct SearchToolbar: View {
     var body: some View {
         VStack(spacing: 10) {
             HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(
+                        focused || !model.query.isEmpty
+                            ? SearchMyMacTheme.lensBlue
+                            : Color.secondary
+                    )
                 TextField("Search filenames and document text", text: $model.query)
                     .textFieldStyle(.plain)
                     .font(.system(size: 18))
@@ -802,8 +963,30 @@ private struct SearchToolbar: View {
                 }
             }
             .padding(.horizontal, 14)
-            .frame(height: 44)
-            .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 11))
+            .frame(height: 46)
+            .background {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color(nsColor: .controlBackgroundColor).opacity(colorScheme == .dark ? 0.82 : 0.92))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(
+                                LinearGradient(
+                                    colors: focused
+                                        ? [SearchMyMacTheme.brightLensBlue, SearchMyMacTheme.lensBlue]
+                                        : [Color.primary.opacity(0.10), SearchMyMacTheme.hairline(for: colorScheme)],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                ),
+                                lineWidth: focused ? 1.15 : 0.65
+                            )
+                    }
+            }
+            .shadow(
+                color: SearchMyMacTheme.lensBlue.opacity(focused ? (colorScheme == .dark ? 0.22 : 0.13) : 0),
+                radius: focused ? 11 : 0,
+                y: 2
+            )
+            .animation(.easeOut(duration: 0.2), value: focused)
 
             HStack(spacing: 8) {
                 Button {
@@ -842,19 +1025,19 @@ private struct SearchToolbar: View {
                         ForEach(selectedRootFilters) { root in
                             FilterChip(title: root.displayName, symbol: "folder") {
                                 model.filters.rootIDs.remove(root.id)
-                                model.scheduleSearch()
+                                model.scheduleSearch(clearingResults: true)
                             }
                         }
                         ForEach(model.filters.pathPrefixes.sorted(), id: \.self) { path in
                             FilterChip(title: URL(fileURLWithPath: path).lastPathComponent, symbol: "folder") {
                                 model.filters.pathPrefixes.remove(path)
-                                model.scheduleSearch()
+                                model.scheduleSearch(clearingResults: true)
                             }
                         }
                         if !model.filters.extensions.isEmpty {
                             FilterChip(title: selectedFileTypesSummary, symbol: "doc") {
                                 model.filters.extensions.removeAll()
-                                model.scheduleSearch()
+                                model.scheduleSearch(clearingResults: true)
                             }
                         }
                         if hasDateFilter {
@@ -930,7 +1113,7 @@ private struct SearchToolbar: View {
     private func clearDateFilter() {
         model.filters.modifiedAfter = nil
         model.filters.modifiedBefore = nil
-        model.scheduleSearch()
+        model.scheduleSearch(clearingResults: true)
     }
 
     private var saveSearchHelp: String {
@@ -988,8 +1171,20 @@ private struct SearchFiltersPopover: View {
     @EnvironmentObject private var model: AppModel
     @Binding var isPresented: Bool
 
-    private let documentExtensions = ["pdf", "docx", "xlsx", "pptx", "md", "txt"]
-    private let imageExtensions = ["jpg", "jpeg", "png", "heic", "tiff"]
+    private let documentTypes = [
+        FileTypeFilterOption(label: "PDF", extensions: ["pdf"]),
+        FileTypeFilterOption(label: "DOC / DOCX", extensions: ["doc", "docx"]),
+        FileTypeFilterOption(label: "XLS / XLSX", extensions: ["xls", "xlsx"]),
+        FileTypeFilterOption(label: "PPT / PPTX", extensions: ["ppt", "pptx"]),
+        FileTypeFilterOption(label: "MD", extensions: ["md"]),
+        FileTypeFilterOption(label: "TXT", extensions: ["txt"])
+    ]
+    private let imageTypes = [
+        FileTypeFilterOption(label: "JPG", extensions: ["jpg", "jpeg"]),
+        FileTypeFilterOption(label: "PNG", extensions: ["png"]),
+        FileTypeFilterOption(label: "HEIC", extensions: ["heic"]),
+        FileTypeFilterOption(label: "TIFF", extensions: ["tif", "tiff"])
+    ]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1047,12 +1242,12 @@ private struct SearchFiltersPopover: View {
                             Text("Documents")
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(.secondary)
-                            fileTypeGrid(documentExtensions)
+                            fileTypeGrid(documentTypes)
                             Text("Images")
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(.secondary)
                                 .padding(.top, 2)
-                            fileTypeGrid(imageExtensions)
+                            fileTypeGrid(imageTypes)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                     } label: {
@@ -1083,7 +1278,7 @@ private struct SearchFiltersPopover: View {
             HStack {
                 Button("Clear All") {
                     model.filters = SearchFilters()
-                    model.scheduleSearch()
+                    model.scheduleSearch(clearingResults: true)
                 }
                 .disabled(!hasActiveFilters)
                 Spacer()
@@ -1139,7 +1334,7 @@ private struct SearchFiltersPopover: View {
                 model.filters.modifiedAfter = preset.dateComponents.flatMap {
                     Calendar.current.date(byAdding: $0, to: .now)
                 }
-                model.scheduleSearch()
+                model.scheduleSearch(clearingResults: true)
             }
         )
     }
@@ -1150,7 +1345,7 @@ private struct SearchFiltersPopover: View {
             set: { enabled in
                 if enabled { model.filters.rootIDs.insert(rootID) }
                 else { model.filters.rootIDs.remove(rootID) }
-                model.scheduleSearch()
+                model.scheduleSearch(clearingResults: true)
             }
         )
     }
@@ -1161,30 +1356,37 @@ private struct SearchFiltersPopover: View {
             set: { enabled in
                 if enabled { model.filters.pathPrefixes.insert(path) }
                 else { model.filters.pathPrefixes.remove(path) }
-                model.scheduleSearch()
+                model.scheduleSearch(clearingResults: true)
             }
         )
     }
 
-    private func extensionFilterBinding(_ fileExtension: String) -> Binding<Bool> {
+    private func extensionFilterBinding(_ extensions: Set<String>) -> Binding<Bool> {
         Binding(
-            get: { model.filters.extensions.contains(fileExtension) },
+            get: { !model.filters.extensions.isDisjoint(with: extensions) },
             set: { enabled in
-                if enabled { model.filters.extensions.insert(fileExtension) }
-                else { model.filters.extensions.remove(fileExtension) }
-                model.scheduleSearch()
+                if enabled { model.filters.extensions.formUnion(extensions) }
+                else { model.filters.extensions.subtract(extensions) }
+                model.scheduleSearch(clearingResults: true)
             }
         )
     }
 
-    private func fileTypeGrid(_ fileExtensions: [String]) -> some View {
+    private func fileTypeGrid(_ options: [FileTypeFilterOption]) -> some View {
         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], alignment: .leading, spacing: 7) {
-            ForEach(fileExtensions, id: \.self) { fileExtension in
-                Toggle(fileExtension.uppercased(), isOn: extensionFilterBinding(fileExtension))
+            ForEach(options) { option in
+                Toggle(option.label, isOn: extensionFilterBinding(option.extensions))
                     .toggleStyle(.checkbox)
             }
         }
     }
+}
+
+private struct FileTypeFilterOption: Identifiable {
+    let label: String
+    let extensions: Set<String>
+
+    var id: String { label }
 }
 
 private enum ModifiedDateFilter: String, Identifiable {
@@ -1428,6 +1630,7 @@ private struct SemanticModeTip: View {
 }
 
 private struct FilterChip: View {
+    @Environment(\.colorScheme) private var colorScheme
     let title: String
     let symbol: String
     let remove: () -> Void
@@ -1452,7 +1655,14 @@ private struct FilterChip: View {
         .padding(.leading, 8)
         .padding(.trailing, 4)
         .frame(height: 24)
-        .background(.quaternary.opacity(0.7), in: Capsule())
+        .foregroundStyle(colorScheme == .dark ? SearchMyMacTheme.brightLensBlue : SearchMyMacTheme.deepLensBlue)
+        .background {
+            Capsule()
+                .fill(SearchMyMacTheme.softSurface(for: colorScheme))
+                .overlay {
+                    Capsule().stroke(SearchMyMacTheme.hairline(for: colorScheme), lineWidth: 0.6)
+                }
+        }
     }
 }
 
@@ -1461,38 +1671,31 @@ private struct SemanticSettingsShortcut: View {
     var label = "Semantic Settings…"
     var symbol = "gear"
 
-    @ViewBuilder
     var body: some View {
-        if #available(macOS 14.0, *) {
-            SettingsLink {
-                Label(label, systemImage: symbol)
-            }
-            .simultaneousGesture(TapGesture().onEnded {
-                selectedSettingsTab = "semantic"
-            })
-            .controlSize(.small)
-        } else {
-            Button {
-                selectedSettingsTab = "semantic"
-                if !NSApplication.shared.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
-                    NSApplication.shared.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
-                }
-            } label: {
-                Label(label, systemImage: symbol)
-            }
-            .controlSize(.small)
+        Button {
+            selectedSettingsTab = "semantic"
+            NotificationCenter.default.post(name: .showSearchMyMacSettings, object: "semantic")
+        } label: {
+            Label(label, systemImage: symbol)
         }
+        .controlSize(.small)
     }
 }
 
 private struct ResultsView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.colorScheme) private var colorScheme
     @FocusState private var resultsFocused: Bool
     @State private var showsPreview = false
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
+                Circle()
+                    .fill(SearchMyMacTheme.lensBlue)
+                    .frame(width: 5, height: 5)
+                    .shadow(color: SearchMyMacTheme.lensBlue.opacity(0.35), radius: 3)
+                    .accessibilityHidden(true)
                 Text(resultSummary)
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
@@ -1518,19 +1721,31 @@ private struct ResultsView: View {
             .padding(.horizontal, 14)
             .frame(height: 34)
             .background(.bar)
+            .overlay(alignment: .bottom) {
+                LinearGradient(
+                    colors: [
+                        Color.clear,
+                        SearchMyMacTheme.hairline(for: colorScheme),
+                        Color.clear
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .frame(height: 0.7)
+            }
 
             HSplitView {
                 ScrollViewReader { proxy in
-                    List(selection: $model.selectedHitPath) {
+                    List {
                         ForEach(resultGroups) { group in
-                            ResultGroupRow(group: group)
-                                .tag(group.primary.path)
+                            ResultGroupRow(
+                                group: group,
+                                isSelected: model.selectedHitPath == group.primary.path
+                            )
                                 .id(group.primary.path)
-                                .listRowBackground(
-                                    model.selectedHitPath == group.primary.path
-                                        ? Color.accentColor.opacity(0.14)
-                                        : Color.clear
-                                )
+                                .listRowBackground(Color.clear)
+                                .listRowSeparator(.hidden)
+                                .listRowInsets(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
                                 .contentShape(Rectangle())
                                 .simultaneousGesture(
                                     TapGesture().onEnded {
@@ -1547,6 +1762,8 @@ private struct ResultsView: View {
                         }
                     }
                     .listStyle(.inset)
+                    .scrollContentBackground(.hidden)
+                    .background(Color.clear)
                     .focusable()
                     .focused($resultsFocused)
                     .onChange(of: model.selectedHitPath) { path in
@@ -1691,10 +1908,11 @@ private struct ResultGroup: Identifiable {
 private struct ResultGroupRow: View {
     @EnvironmentObject private var model: AppModel
     let group: ResultGroup
+    let isSelected: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            ResultRow(hit: group.primary)
+            ResultRow(hit: group.primary, isSelected: isSelected)
             if !group.copies.isEmpty {
                 Menu {
                     ForEach(group.copies, id: \.path) { copy in
@@ -1723,6 +1941,7 @@ private struct ResultGroupRow: View {
 }
 
 private struct ShortcutHint: View {
+    @Environment(\.colorScheme) private var colorScheme
     let keys: String
     let label: String
 
@@ -1730,9 +1949,17 @@ private struct ShortcutHint: View {
         HStack(spacing: 4) {
             Text(keys)
                 .font(.caption2.monospaced())
+                .foregroundStyle(
+                    colorScheme == .dark
+                        ? SearchMyMacTheme.brightLensBlue
+                        : SearchMyMacTheme.deepLensBlue
+                )
                 .padding(.horizontal, 5)
                 .padding(.vertical, 2)
-                .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
+                .background(
+                    SearchMyMacTheme.softSurface(for: colorScheme),
+                    in: RoundedRectangle(cornerRadius: 4, style: .continuous)
+                )
             Text(label)
                 .font(.caption2)
         }
@@ -1790,6 +2017,14 @@ private struct ResultPreviewPane: View {
             .padding(10)
         }
         .background(.background)
+        .overlay(alignment: .top) {
+            LinearGradient(
+                colors: [Color.clear, SearchMyMacTheme.lensBlue.opacity(0.45), Color.clear],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+            .frame(height: 1)
+        }
         .accessibilityElement(children: .contain)
     }
 
@@ -1825,9 +2060,11 @@ private struct ResultRow: View {
     @State private var isHovering = false
     @State private var fileIcon: NSImage
     let hit: SearchHit
+    let isSelected: Bool
 
-    init(hit: SearchHit) {
+    init(hit: SearchHit, isSelected: Bool) {
         self.hit = hit
+        self.isSelected = isSelected
         _fileIcon = State(initialValue: NSWorkspace.shared.icon(forFile: hit.path))
     }
 
@@ -1853,7 +2090,7 @@ private struct ResultRow: View {
                 }
                 HStack(spacing: 5) {
                     if !hit.fileExtension.isEmpty {
-                        Text(hit.fileExtension.uppercased())
+                        FileTypeBadge(fileExtension: hit.fileExtension)
                     }
                     Text(displayLocation)
                         .lineLimit(1)
@@ -1863,8 +2100,16 @@ private struct ResultRow: View {
                         Text(modified, style: .date)
                     }
                     Spacer()
-                    Text(matchReason)
-                        .foregroundStyle(secondaryColor.opacity(0.9))
+                    Label(matchReason, systemImage: matchReasonSymbol)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(
+                            colorScheme == .dark
+                                ? SearchMyMacTheme.brightLensBlue
+                                : SearchMyMacTheme.deepLensBlue
+                        )
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(SearchMyMacTheme.softSurface(for: colorScheme), in: Capsule())
                 }
                 .font(.caption)
                 .foregroundStyle(secondaryColor)
@@ -1886,10 +2131,30 @@ private struct ResultRow: View {
             }
         }
         .foregroundStyle(Color.primary)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 11)
+        .padding(.vertical, 10)
+        .background {
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(
+                    isSelected
+                        ? (colorScheme == .dark
+                            ? SearchMyMacTheme.brightLensBlue.opacity(0.14)
+                            : SearchMyMacTheme.lensBlue.opacity(0.09))
+                        : Color.clear
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .stroke(
+                            isSelected ? SearchMyMacTheme.hairline(for: colorScheme) : Color.clear,
+                            lineWidth: 0.7
+                        )
+                }
+        }
+        .animation(.easeOut(duration: 0.18), value: isSelected)
         .onHover { isHovering = $0 }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilitySummary)
+        .accessibilityValue(isSelected ? "Selected" : "")
     }
 
     private var secondaryColor: Color {
@@ -1917,6 +2182,14 @@ private struct ResultRow: View {
             return "Text match"
         }
         return model.effectiveMode == .text ? "Content match" : "Related content"
+    }
+
+    private var matchReasonSymbol: String {
+        switch matchReason {
+        case "Filename match": "text.magnifyingglass"
+        case "Text match", "Content match": "text.quote"
+        default: "sparkles"
+        }
     }
 
     private var accessibilitySummary: String {
@@ -2098,11 +2371,101 @@ private struct AvailabilityBadge: View {
     }
 }
 
+private struct FileTypeBadge: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let fileExtension: String
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(accentColor)
+                .frame(width: 5, height: 5)
+            Text(fileExtension.uppercased())
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(
+            accentColor.opacity(colorScheme == .dark ? 0.14 : 0.075),
+            in: Capsule()
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(fileExtension.uppercased()) file")
+    }
+
+    private var accentColor: Color {
+        switch fileExtension.lowercased() {
+        case "pdf":
+            Color(nsColor: .systemRed)
+        case "doc", "docx", "pages", "rtf":
+            Color(nsColor: .systemBlue)
+        case "xls", "xlsx", "csv", "tsv", "numbers", "ods":
+            Color(nsColor: .systemGreen)
+        case "ppt", "pptx", "key", "odp":
+            Color(nsColor: .systemOrange)
+        case "jpg", "jpeg", "png", "heic", "tif", "tiff", "gif", "webp":
+            Color(nsColor: .systemPurple)
+        case "md", "markdown", "txt":
+            Color(nsColor: .systemTeal)
+        default:
+            SearchMyMacTheme.lensBlue
+        }
+    }
+}
+
+private struct SearchAura: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isBreathing = false
+
+    let symbol: String
+    var size: CGFloat = 78
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(SearchMyMacTheme.hairline(for: colorScheme), lineWidth: 1)
+                .scaleEffect(isBreathing ? 1.04 : 0.94)
+                .opacity(isBreathing ? 0.35 : 0.75)
+
+            Circle()
+                .fill(
+                    RadialGradient(
+                        colors: [
+                            SearchMyMacTheme.brightLensBlue.opacity(colorScheme == .dark ? 0.18 : 0.13),
+                            SearchMyMacTheme.lensBlue.opacity(0.035)
+                        ],
+                        center: .center,
+                        startRadius: 2,
+                        endRadius: size * 0.52
+                    )
+                )
+                .padding(7)
+
+            Image(systemName: symbol)
+                .font(.system(size: size * 0.33, weight: .medium))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(SearchMyMacTheme.lensBlue)
+        }
+        .frame(width: size, height: size)
+        .onAppear {
+            guard !reduceMotion else { return }
+            isBreathing = true
+        }
+        .animation(
+            reduceMotion ? nil : .easeInOut(duration: 2.8).repeatForever(autoreverses: true),
+            value: isBreathing
+        )
+        .accessibilityHidden(true)
+    }
+}
+
 private struct OnboardingView: View {
     @EnvironmentObject private var model: AppModel
     var body: some View {
         VStack(spacing: 18) {
-            Image(systemName: "doc.text.magnifyingglass").font(.system(size: 56)).foregroundStyle(.tint)
+            SearchAura(symbol: "doc.text.magnifyingglass", size: 92)
             Text("Find the document, not just the filename").font(.largeTitle.bold())
             Text("Search My Mac builds a private local index. Your documents and searches never leave this Mac.")
                 .foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 520)
@@ -2121,7 +2484,7 @@ private struct OnboardingView: View {
 private struct EmptySearchView: View {
     var body: some View {
         VStack(spacing: 14) {
-            Image(systemName: "text.magnifyingglass").font(.system(size: 42)).foregroundStyle(.secondary)
+            SearchAura(symbol: "text.magnifyingglass")
             Text("What are you looking for?").font(.title2)
             Text("Search by a filename, a phrase you remember, or what the document was about.")
                 .foregroundStyle(.secondary)
@@ -2161,7 +2524,7 @@ private struct EmptyResultsView: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            Image(systemName: "questionmark.folder").font(.system(size: 42)).foregroundStyle(.secondary)
+            SearchAura(symbol: "questionmark.folder")
             Text(title).font(.title2)
             Text(message)
                 .foregroundStyle(.secondary)

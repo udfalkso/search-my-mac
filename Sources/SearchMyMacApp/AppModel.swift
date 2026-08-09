@@ -154,7 +154,7 @@ final class AppModel: ObservableObject {
         }
         let querySnapshot = query
         let modeSnapshot = mode
-        let filterSnapshot = filters
+        let filterSnapshot = filters.resolvingRootLocations(roots)
         let hybridSemanticWeightSnapshot = hybridSemanticWeight
         isSearching = true
         showsSearchSpinner = results.isEmpty

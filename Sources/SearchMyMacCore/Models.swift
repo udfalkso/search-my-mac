@@ -129,6 +129,19 @@ public struct SearchFilters: Codable, Equatable, Sendable {
         self.modifiedBefore = modifiedBefore
     }
 
+    /// Resolves user-facing indexed locations to their physical paths. A file
+    /// can retain the ownership ID of a broader root when roots overlap (for
+    /// example, a folder indexed separately inside Home), but users expect a
+    /// location filter to mean "inside this folder."
+    public func resolvingRootLocations(_ roots: [IndexRoot]) -> SearchFilters {
+        var resolved = self
+        for root in roots where resolved.rootIDs.contains(root.id) {
+            resolved.pathPrefixes.insert(root.url.standardizedFileURL.path)
+            resolved.rootIDs.remove(root.id)
+        }
+        return resolved
+    }
+
     private enum CodingKeys: String, CodingKey {
         case rootIDs, pathPrefixes, extensions, modifiedAfter, modifiedBefore
     }

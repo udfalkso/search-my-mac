@@ -209,6 +209,9 @@ private struct StubOCRTextRecognizer: OCRTextRecognizing {
     try "personal document phrase".write(
         to: documentFolder.appendingPathComponent("notes.txt"), atomically: true, encoding: .utf8
     )
+    try "{\"private\": \"structured phrase\"}".write(
+        to: codeFolder.appendingPathComponent("fixture.json"), atomically: true, encoding: .utf8
+    )
 
     let engine = try LocalSearchEngine(storageURL: storage)
     let root = IndexRoot(id: "home", url: rootURL)
@@ -218,12 +221,14 @@ private struct StubOCRTextRecognizer: OCRTextRecognizing {
 
     try await engine.updateIndexingPreferences(IndexingPreferences(excludeSourceCode: false))
     try await engine.index(root: root)
-    #expect(try await engine.health().fileCount == 2)
+    #expect(try await engine.health().fileCount == 3)
     #expect(try await engine.search(SearchRequest(query: "private code phrase")).hits.count == 1)
+    #expect(try await engine.search(SearchRequest(query: "structured phrase")).hits.count == 1)
 
     try await engine.updateIndexingPreferences(IndexingPreferences(excludeSourceCode: true))
     #expect(try await engine.health().fileCount == 1)
     #expect(try await engine.search(SearchRequest(query: "private code phrase")).hits.isEmpty)
+    #expect(try await engine.search(SearchRequest(query: "structured phrase")).hits.isEmpty)
 
     let usage = try await engine.folderUsage(limit: 10)
     #expect(usage.contains(where: { $0.path == documentFolder.path && $0.fileCount == 1 }))
@@ -812,6 +817,20 @@ private struct StubOCRTextRecognizer: OCRTextRecognizing {
 
 @Test func xpcInterfaceUsesExplicitSecureClassLists() {
     _ = XPCSecurity.engineInterface()
+}
+
+@Test func indexedLocationFiltersResolveOverlappingRootsToPhysicalPaths() {
+    let home = URL(fileURLWithPath: "/Users/example")
+    let nested = home.appendingPathComponent("backups/Bob Computer")
+    let filters = SearchFilters(rootIDs: ["nested", "missing"])
+
+    let resolved = filters.resolvingRootLocations([
+        IndexRoot(id: "home", url: home, displayName: "Home"),
+        IndexRoot(id: "nested", url: nested, displayName: "Bob Computer")
+    ])
+
+    #expect(resolved.rootIDs == ["missing"])
+    #expect(resolved.pathPrefixes == [nested.path])
 }
 
 @Test func filtersAndCompletedReconciliationRemoveConfirmedDeletions() async throws {

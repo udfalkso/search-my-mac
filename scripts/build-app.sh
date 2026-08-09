@@ -3,9 +3,27 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_ROOT="$PROJECT_ROOT/.build"
-APP_ROOT="$BUILD_ROOT/Search My Mac.app"
+APP_ROOT="${SMM_APP_ROOT:-$BUILD_ROOT/Search My Mac.app}"
+case "$APP_ROOT" in
+  */Search\ My\ Mac.app) ;;
+  *)
+    echo "SMM_APP_ROOT must end in 'Search My Mac.app': $APP_ROOT" >&2
+    exit 1
+    ;;
+esac
 XPC_ROOT="$APP_ROOT/Contents/XPCServices/com.searchmymac.app.engine.xpc"
-LOCAL_SIGNING_CONFIG="$PROJECT_ROOT/.smm-signing.env"
+LOCAL_SIGNING_CONFIG="${SMM_SIGNING_CONFIG:-$PROJECT_ROOT/.smm-signing.env}"
+# A worktree may deliberately assemble over the stable bundle in the primary
+# checkout so macOS keeps the app's TCC identity and folder grants. Reuse that
+# checkout's ignored signing configuration when the worktree has none, rather
+# than silently falling back to a new ad-hoc identity on every rebuild.
+if [[ -z "${SMM_SIGNING_CONFIG:-}" && ! -f "$LOCAL_SIGNING_CONFIG" ]]; then
+  OUTPUT_PROJECT_ROOT="$(dirname "$(dirname "$APP_ROOT")")"
+  OUTPUT_SIGNING_CONFIG="$OUTPUT_PROJECT_ROOT/.smm-signing.env"
+  if [[ -f "$OUTPUT_SIGNING_CONFIG" ]]; then
+    LOCAL_SIGNING_CONFIG="$OUTPUT_SIGNING_CONFIG"
+  fi
+fi
 CONFIG_SIGNING_IDENTITY=""
 CONFIG_TEAM_IDENTIFIER=""
 if [[ -f "$LOCAL_SIGNING_CONFIG" ]]; then
@@ -18,6 +36,9 @@ if [[ -f "$LOCAL_SIGNING_CONFIG" ]]; then
 fi
 SIGNING_IDENTITY="${SMM_CODESIGN_IDENTITY:-${CONFIG_SIGNING_IDENTITY:--}}"
 TEAM_IDENTIFIER="${SMM_TEAM_ID:-$CONFIG_TEAM_IDENTIFIER}"
+if [[ "$SIGNING_IDENTITY" == "-" ]]; then
+  echo "Warning: ad-hoc signing changes the app's macOS permission identity on every rebuild." >&2
+fi
 BUILD_CONFIGURATION="${SMM_CONFIGURATION:-debug}"
 PRIVATE_ENTITLEMENTS="${SMM_PRIVATE_ENTITLEMENTS:-0}"
 if [[ -x /opt/homebrew/opt/rust/bin/cargo ]]; then

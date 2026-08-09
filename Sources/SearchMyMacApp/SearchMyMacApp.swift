@@ -25,13 +25,12 @@ struct SearchMyMacApplication: App {
                 }
                 .keyboardShortcut("f", modifiers: [.command])
             }
-        }
-
-        Settings {
-            SettingsView()
-                .environmentObject(model)
-                .preferredColorScheme(selectedAppearance.colorScheme)
-                .frame(width: 600, height: 480)
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") {
+                    NotificationCenter.default.post(name: .showSearchMyMacSettings, object: nil)
+                }
+                .keyboardShortcut(",", modifiers: [.command])
+            }
         }
     }
 
@@ -98,4 +97,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension Notification.Name {
     static let focusSearchMyMacField = Notification.Name("SearchMyMac.focusSearchField")
+    static let showSearchMyMacSettings = Notification.Name("SearchMyMac.showSettings")
 }

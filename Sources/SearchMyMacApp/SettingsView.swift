@@ -8,18 +8,41 @@ struct SettingsView: View {
     @State private var showsClearHistoryConfirmation = false
 
     var body: some View {
-        TabView(selection: $selectedTab) {
-            generalSettings
-            .tabItem { Label("General", systemImage: "gear") }
-            .tag("general")
+        VStack(spacing: 0) {
+            HStack(alignment: .bottom, spacing: 24) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Settings")
+                        .font(.largeTitle.bold())
+                    Text("Choose how Search My Mac works for you")
+                        .foregroundStyle(.secondary)
+                }
 
-            semanticSettings
-            .tabItem { Label("Semantic", systemImage: "brain") }
-            .tag("semantic")
+                Spacer(minLength: 24)
 
-            privacySettings
-            .tabItem { Label("Privacy", systemImage: "hand.raised") }
-            .tag("privacy")
+                Picker("Settings section", selection: $selectedTab) {
+                    Text("General").tag("general")
+                    Text("Semantic").tag("semantic")
+                    Text("Privacy").tag("privacy")
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 330)
+            }
+            .padding(.horizontal, 30)
+            .padding(.vertical, 22)
+
+            Divider()
+
+            selectedSettings
+        }
+    }
+
+    @ViewBuilder
+    private var selectedSettings: some View {
+        switch selectedTab {
+        case "semantic": semanticSettings
+        case "privacy": privacySettings
+        default: generalSettings
         }
     }
 
@@ -116,16 +139,18 @@ struct SettingsView: View {
     }
 
     private func settingsHeader(title: String, subtitle: String, symbol: String) -> some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 12) {
             Image(systemName: symbol)
-                .font(.system(size: 23, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 50, height: 50)
-                .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                .font(.system(size: 16, weight: .semibold))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(.tint)
+                .frame(width: 36, height: 36)
+                .background(Color.accentColor.opacity(0.11), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             VStack(alignment: .leading, spacing: 4) {
                 Text(title)
-                    .font(.title2.weight(.semibold))
+                    .font(.title3.weight(.semibold))
                 Text(subtitle)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
             }
         }
@@ -253,17 +278,19 @@ struct SettingsView: View {
     }
 
     private var semanticHeader: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 12) {
             Image(systemName: "brain")
-                .font(.system(size: 24, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 50, height: 50)
-                .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                .font(.system(size: 16, weight: .semibold))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(.tint)
+                .frame(width: 36, height: 36)
+                .background(Color.accentColor.opacity(0.11), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
             VStack(alignment: .leading, spacing: 4) {
                 Text("Semantic Search")
-                    .font(.title2.weight(.semibold))
+                    .font(.title3.weight(.semibold))
                 Text("Private, on-device meaning-based search")
+                    .font(.callout)
                     .foregroundStyle(.secondary)
             }
 

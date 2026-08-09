@@ -39,7 +39,7 @@ public struct DiscoverySummary: Sendable, Equatable {
 public struct DiscoveryPolicy: Sendable {
     /// Increment whenever an exclusion changes so existing indexes are cleaned
     /// immediately instead of retaining old-policy records until a full scan ends.
-    public static let version = 3
+    public static let version = 4
 
     public var excludedDirectoryNames: Set<String>
     public var excludedPathComponents: Set<String>
@@ -79,7 +79,8 @@ public struct DiscoveryPolicy: Sendable {
             "php", "cs", "fs", "fsx", "vb", "scala", "sc", "lua", "r", "dart",
             "ex", "exs", "erl", "hrl", "clj", "cljs", "cljc", "groovy", "gradle",
             "vue", "svelte", "zig", "sol", "asm", "s", "pl", "pm",
-            "sh", "bash", "zsh", "fish", "sql", "css", "scss", "less"
+            "sh", "bash", "zsh", "fish", "sql", "css", "scss", "less",
+            "json", "jsonl"
         ]
     ) {
         self.excludedDirectoryNames = Set(excludedDirectoryNames.map(Self.normalizedComponent))
