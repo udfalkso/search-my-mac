@@ -15,25 +15,30 @@ actor SemanticVectorIndex {
     private let modelID: String
     private let dimensions: Int
     private let vectors: FlatVectorStore
+    private let isReadOnly: Bool
     private var snapshot: USearchIndex?
     private var snapshotKeys: Set<UInt64> = []
     private var activeKeys: Set<UInt64> = []
     private var isPrepared = false
 
-    init(directory: URL, modelID: String, dimensions: Int) throws {
+    init(directory: URL, modelID: String, dimensions: Int, readOnly: Bool = false) throws {
         self.directory = directory
         self.manifestURL = directory.appendingPathComponent("hnsw-current.json")
         self.modelID = modelID
         self.dimensions = dimensions
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        vectors = try FlatVectorStore(directory: directory)
+        self.isReadOnly = readOnly
+        if !readOnly {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
+        vectors = try FlatVectorStore(directory: directory, readOnly: readOnly)
     }
 
     func append(key: UInt64, vector: [Float]) async throws {
+        guard !isReadOnly else { throw SearchMyMacError.semantic("The semantic index was opened read-only.") }
         guard vector.count == dimensions else {
             throw SearchMyMacError.semantic("Embedding dimension mismatch: expected \(dimensions), received \(vector.count).")
         }
@@ -43,6 +48,7 @@ actor SemanticVectorIndex {
     }
 
     func tombstone(keys: [UInt64]) async throws {
+        guard !isReadOnly else { throw SearchMyMacError.semantic("The semantic index was opened read-only.") }
         try await prepareIfNeeded()
         for key in keys {
             try await vectors.tombstone(key: key)
@@ -72,6 +78,7 @@ actor SemanticVectorIndex {
     }
 
     func rebuildIfNeeded(force: Bool = false) async throws {
+        guard !isReadOnly else { return }
         try await prepareIfNeeded()
         let addedThresholdReached = await vectors.shouldRebuildSnapshot(snapshotKeys: snapshotKeys)
         let removedCount = snapshotKeys.subtracting(activeKeys).count
@@ -136,6 +143,7 @@ actor SemanticVectorIndex {
     }
 
     func clear() async throws {
+        guard !isReadOnly else { throw SearchMyMacError.semantic("The semantic index was opened read-only.") }
         snapshot = nil
         snapshotKeys.removeAll()
         activeKeys.removeAll()

@@ -4,21 +4,12 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
     @AppStorage("settings.selectedTab") private var selectedTab = "general"
+    @AppStorage(AppAppearance.storageKey) private var appearance = AppAppearance.system.rawValue
+    @State private var showsClearHistoryConfirmation = false
 
     var body: some View {
         TabView(selection: $selectedTab) {
-            Form {
-                Toggle("Launch Search My Mac at login", isOn: Binding(
-                    get: { model.launchAtLogin },
-                    set: { model.updateLaunchAtLogin($0) }
-                ))
-                Text("Closing the search window leaves indexing and the global shortcut available. Choosing Quit stops all work.")
-                    .font(.caption).foregroundStyle(.secondary)
-                LabeledContent("Indexed files", value: model.health.fileCount.formatted())
-                LabeledContent("Searchable passages", value: model.health.passageCount.formatted())
-                LabeledContent("Index storage", value: ByteCountFormatter.string(fromByteCount: model.health.databaseBytes, countStyle: .file))
-            }
-            .padding(20)
+            generalSettings
             .tabItem { Label("General", systemImage: "gear") }
             .tag("general")
 
@@ -26,19 +17,221 @@ struct SettingsView: View {
             .tabItem { Label("Semantic", systemImage: "brain") }
             .tag("semantic")
 
-            Form {
-                Text("The local index contains transformed document text. It is protected by owner-only filesystem permissions and FileVault when enabled.")
-                Toggle("Record search history", isOn: Binding(
-                    get: { model.historyRecordingEnabled },
-                    set: { model.updateHistoryRecording($0) }
-                ))
-                Text("Turning this off does not delete existing history. Search ranking currently does not use history for personalization.")
-                    .font(.caption).foregroundStyle(.secondary)
-                Button("Clear Search History", role: .destructive) { model.clearHistory() }
-            }
-            .padding(20)
+            privacySettings
             .tabItem { Label("Privacy", systemImage: "hand.raised") }
             .tag("privacy")
+        }
+    }
+
+    private var generalSettings: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 26) {
+                settingsHeader(
+                    title: "General",
+                    subtitle: "Choose how Search My Mac looks and behaves",
+                    symbol: "gearshape.fill"
+                )
+
+                VStack(spacing: 0) {
+                    Toggle(isOn: Binding(
+                        get: { model.launchAtLogin },
+                        set: { model.updateLaunchAtLogin($0) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Keep Search My Mac ready")
+                                .font(.headline)
+                            Text("Launch at login and continue indexing after the search window closes.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .padding(18)
+
+                    Divider().padding(.leading, 18)
+
+                    HStack(spacing: 24) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Appearance")
+                                .font(.headline)
+                            Text("System follows your Mac automatically.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 12)
+                        Picker("Appearance", selection: $appearance) {
+                            ForEach(AppAppearance.allCases) { appearance in
+                                Text(appearance.title).tag(appearance.rawValue)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .frame(width: 230)
+                    }
+                    .padding(18)
+                }
+                .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Index at a glance")
+                        .font(.headline)
+                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                        SettingsMetricCard(
+                            title: "Files",
+                            value: model.health.fileCount.formatted(),
+                            symbol: "doc.on.doc"
+                        )
+                        SettingsMetricCard(
+                            title: "Text sections",
+                            value: model.health.passageCount.formatted(),
+                            symbol: "text.alignleft"
+                        )
+                        SettingsMetricCard(
+                            title: "Text search",
+                            value: ByteCountFormatter.string(
+                                fromByteCount: model.health.nonSemanticStorageBytes,
+                                countStyle: .file
+                            ),
+                            symbol: "text.document"
+                        )
+                        SettingsMetricCard(
+                            title: "Semantic search",
+                            value: ByteCountFormatter.string(
+                                fromByteCount: model.health.semanticStorageBytes,
+                                countStyle: .file
+                            ),
+                            symbol: "brain"
+                        )
+                    }
+                    Text("Open Index Health from the main window for storage details, exclusions, and coverage.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: 680, alignment: .leading)
+            .padding(.horizontal, 36)
+            .padding(.vertical, 30)
+            .frame(maxWidth: .infinity, alignment: .center)
+        }
+    }
+
+    private func settingsHeader(title: String, subtitle: String, symbol: String) -> some View {
+        HStack(spacing: 16) {
+            Image(systemName: symbol)
+                .font(.system(size: 23, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 50, height: 50)
+                .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.title2.weight(.semibold))
+                Text(subtitle)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var privacySettings: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 26) {
+                settingsHeader(
+                    title: "Privacy",
+                    subtitle: "Control what Search My Mac remembers",
+                    symbol: "hand.raised.fill"
+                )
+
+                HStack(alignment: .top, spacing: 16) {
+                    Image(systemName: "lock.shield.fill")
+                        .font(.system(size: 25, weight: .semibold))
+                        .foregroundStyle(.tint)
+                        .frame(width: 34)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Private by design")
+                            .font(.headline)
+                        Text("Document text, filenames, meaning-based search data, and search queries stay on this Mac. Search My Mac includes no telemetry or cloud search service.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(18)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(Color.accentColor.opacity(0.14), lineWidth: 1)
+                }
+
+                VStack(spacing: 0) {
+                    Toggle(isOn: Binding(
+                        get: { model.historyRecordingEnabled },
+                        set: { model.updateHistoryRecording($0) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Remember search history")
+                                .font(.headline)
+                            Text("Keep recent searches in the sidebar for quick access.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .padding(18)
+
+                    Divider().padding(.leading, 18)
+
+                    HStack(spacing: 18) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Clear saved history")
+                                .font(.headline)
+                            Text("Pausing history does not remove searches already stored.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 12)
+                        Button("Clear History…", role: .destructive) {
+                            showsClearHistoryConfirmation = true
+                        }
+                        .disabled(model.history.isEmpty)
+                    }
+                    .padding(18)
+                }
+                .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 14) {
+                    Text("How your index is protected")
+                        .font(.headline)
+                    PrivacyFeatureRow(
+                        symbol: "person.crop.circle.badge.checkmark",
+                        title: "Owner-only storage",
+                        detail: "Index files are readable only by your macOS user account."
+                    )
+                    PrivacyFeatureRow(
+                        symbol: "externaldrive.badge.checkmark",
+                        title: "FileVault at rest",
+                        detail: "When FileVault is enabled, macOS encrypts the index along with the rest of your disk."
+                    )
+                    PrivacyFeatureRow(
+                        symbol: "network.slash",
+                        title: "No document uploads",
+                        detail: "Network access is never used to process your documents or answer searches."
+                    )
+                }
+            }
+            .frame(maxWidth: 680, alignment: .leading)
+            .padding(.horizontal, 36)
+            .padding(.vertical, 30)
+            .frame(maxWidth: .infinity, alignment: .center)
+        }
+        .confirmationDialog(
+            "Clear Search History?",
+            isPresented: $showsClearHistoryConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Clear History", role: .destructive) { model.clearHistory() }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This permanently removes every stored search from the History section.")
         }
     }
 
@@ -47,6 +240,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 28) {
                 semanticHeader
                 semanticDetails
+                hybridBalanceSettings
                 semanticExplanation
                 semanticActions
             }
@@ -104,7 +298,7 @@ struct SettingsView: View {
             if model.semanticStatus.phase != .notInstalled && model.semanticStatus.phase != .downloading {
                 Divider().padding(.leading, 20)
                 SemanticDetailRow(
-                    title: "Passages embedded",
+                    title: "Searchable sections ready",
                     value: "\(model.semanticStatus.embeddedPassages.formatted()) of \(model.semanticStatus.totalPassages.formatted())"
                 )
             }
@@ -137,13 +331,58 @@ struct SettingsView: View {
             )
             SemanticFeatureRow(
                 icon: "bolt",
-                text: "Search becomes available as soon as the first passages are embedded, while the rest are processed gradually."
+                text: "Semantic search becomes available as soon as the first document sections are ready, while the rest are prepared gradually."
             )
             SemanticFeatureRow(
                 icon: "text.magnifyingglass",
-                text: "Hybrid mode combines precise BM25 text ranking with semantic similarity."
+                text: "Hybrid mode combines exact word and phrase matching with meaning-based results."
             )
         }
+    }
+
+    private var hybridBalanceSettings: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Hybrid search balance")
+                        .font(.headline)
+                    Text("Choose how strongly Hybrid mode favors exact wording or similar meaning.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 20)
+                Text(hybridBalanceSummary)
+                    .font(.callout.weight(.medium))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+
+            Slider(
+                value: Binding(
+                    get: { model.hybridSemanticWeight },
+                    set: { model.updateHybridSemanticWeight($0) }
+                ),
+                in: 0...1,
+                step: 0.05
+            )
+            .accessibilityLabel("Hybrid search balance")
+            .accessibilityValue(hybridBalanceSummary)
+
+            HStack {
+                Label("Exact text", systemImage: "text.magnifyingglass")
+                Spacer()
+                Label("Similar meaning", systemImage: "brain")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .padding(20)
+        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private var hybridBalanceSummary: String {
+        let semanticPercent = Int((model.hybridSemanticWeight * 100).rounded())
+        return "Text \(100 - semanticPercent)% · Meaning \(semanticPercent)%"
     }
 
     @ViewBuilder
@@ -173,7 +412,7 @@ struct SettingsView: View {
             Spacer()
 
             if model.semanticStatus.phase != .notInstalled && model.semanticStatus.phase != .downloading {
-                Button("Remove Model & Index", role: .destructive) {
+                Button("Remove Semantic Search", role: .destructive) {
                     model.removeSemanticModel()
                 }
             }
@@ -212,6 +451,52 @@ struct SettingsView: View {
         case .ready: .green
         case .paused: .orange
         case .failed: .red
+        }
+    }
+}
+
+private struct SettingsMetricCard: View {
+    let title: String
+    let value: String
+    let symbol: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Image(systemName: symbol)
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.tint)
+            Text(value)
+                .font(.title3.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 82, alignment: .leading)
+        .padding(14)
+        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+private struct PrivacyFeatureRow: View {
+    let symbol: String
+    let title: String
+    let detail: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: symbol)
+                .foregroundStyle(.tint)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.callout.weight(.medium))
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 }

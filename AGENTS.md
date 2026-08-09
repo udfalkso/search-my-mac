@@ -11,13 +11,15 @@ The main app remains resident after its windows close. It owns filesystem/TCC ac
 ## Repository layout
 
 - `Sources/SearchMyMacApp/`: SwiftUI/AppKit app, state model, settings, global shortcut, and Quick Look.
+- `Sources/SearchMyMacCLI/`: read-only `smm` CLI with JSON/JSONL/path/text output for automation and AI tools.
 - `Sources/SearchMyMacCore/`: discovery, extraction, SQLite manifest/FTS, ranking, FSEvents, vectors, and XPC contracts.
 - `Sources/SearchMyMacEngineService/`: bundled authenticated engine XPC service.
 - `Tests/SearchMyMacCoreTests/`: Swift Testing coverage for indexing, queries, migrations, vectors, XPC, history, and discovery policy.
-- `rust-engine/`: Tantivy Rust `cdylib` and C ABI. SQLite FTS5 is still the active app search path.
+- `rust-engine/`: Tantivy Rust `cdylib` and C ABI. Tantivy is the active lexical path once its committed generation matches SQLite; FTS5 is the repair-time fallback.
 - `Resources/`: app/XPC plists and development/distribution entitlements.
 - `scripts/build-app.sh`: Swift/Rust build, `.app` assembly, and inside-out signing.
 - `docs/ARCHITECTURE.md`: architecture and durability decisions.
+- `docs/CLI_REFERENCE.md`: machine-oriented contract and safe usage guidance for the bundled `smm` command.
 - `docs/RELEASE_GATES.md`: known work required before public release.
 
 There is no Xcode project. The codebase is a Swift Package plus a Rust crate.
@@ -29,6 +31,9 @@ Run commands from the repository root.
 ```sh
 # Build, assemble, and sign the runnable app bundle
 ./scripts/build-app.sh
+
+# Build a .pkg that installs the app and /usr/local/bin/smm
+./scripts/build-installer.sh
 
 # Test Swift code using workspace-local caches
 CLANG_MODULE_CACHE_PATH=.build/clang-cache swift test \
@@ -73,6 +78,12 @@ If `open` fails with `RBSRequestErrorDomain Code=5`, `NSPOSIXErrorDomain Code=16
 
 ## Important implementation invariants
 
+### Development persistence policy
+
+- This is a new application under active development. Do not preserve obsolete development index formats or add migration complexity merely to protect local test data.
+- Prefer a clean schema/version reset and complete reindex when an architectural change makes that simpler or safer. The local index is disposable and rebuildable.
+- Keep genuinely user-owned configuration conceptually separate from derived index data in the final architecture, even if development resets currently clear both.
+
 ### Discovery and indexing
 
 - Discovery and extraction are pipelined. Bounded batches are staged in SQLite and relevant files begin indexing before the complete filesystem walk finishes.
@@ -84,8 +95,9 @@ If `open` fails with `RBSRequestErrorDomain Code=5`, `NSPOSIXErrorDomain Code=16
 - Increment `DiscoveryPolicy.version` whenever exclusion behavior changes. On the next reconciliation, each root incrementally purges records admitted by an older policy before starting filesystem discovery.
 - Check file identity before and after extraction. Discard and requeue unstable results.
 - Do not follow symlinks or recurse into packages, arbitrary archives, attachments, or app internals.
+- Common standalone image formats are content-bearing files. Extract their visible text locally with Vision OCR using bounded, downsampled images; never upload image content.
 
-`DiscoveryPolicy` applies high-confidence structural exclusions before traversal work is performed. It currently excludes dependency/build/cache trees including `node_modules`, the contiguous relative path `go/pkg/mod`, Python environments and `site-packages`, CocoaPods, Carthage, SwiftPM output, and DerivedData. Entire Home scans treat `~/Library` as a corridor only to `CloudStorage` and `Mobile Documents`. Selecting an otherwise excluded folder directly makes it the root and intentionally opts it back in. Apply the same policy to full scans and single-file FSEvents handling so ignored content cannot re-enter the index.
+`DiscoveryPolicy` applies high-confidence structural exclusions before traversal work is performed. It excludes common source-code extensions by default, along with dependency/build/cache trees including `node_modules`, the contiguous relative path `go/pkg/mod`, Python environments and `site-packages`, CocoaPods, Carthage, SwiftPM output, and DerivedData. Entire Home scans treat `~/Library` as a corridor only to `CloudStorage` and `Mobile Documents`. Selecting an otherwise excluded folder directly makes it the root and intentionally opts it back in; the source-code switch can be disabled when code itself should be indexed. Apply the same policy to full scans and single-file FSEvents handling so ignored content cannot re-enter the index.
 
 macOS has no trustworthy “the user authored this file” attribute. Do not substitute owner UID, creation date, or quarantine metadata as provenance. Prefer conservative structural defaults plus future user-visible include/exclude controls.
 
@@ -97,6 +109,7 @@ macOS has no trustworthy “the user authored this file” attribute. Do not sub
 - Pagination cursors include the index generation and must fail cleanly when stale.
 - Search history is normalized for case, accents, width, and whitespace. Repeating a query replaces/moves the existing entry rather than creating a duplicate.
 - Semantic and Hybrid modes report the effective mode as text until at least one passage embedding is searchable. The optional model is Qwen3 Embedding 0.6B Q8 GGUF, loaded through llama.cpp; never remove its size/SHA-256 verification.
+- Semantic indexing advances in coverage rounds across distinct source files. Within a round, newer files come first; CSV, TSV, Excel, ODS, and Numbers files are deliberately lowest priority so large tabular data cannot crowd out prose documents.
 
 ### Security and privacy
 

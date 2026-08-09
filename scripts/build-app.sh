@@ -20,6 +20,13 @@ SIGNING_IDENTITY="${SMM_CODESIGN_IDENTITY:-${CONFIG_SIGNING_IDENTITY:--}}"
 TEAM_IDENTIFIER="${SMM_TEAM_ID:-$CONFIG_TEAM_IDENTIFIER}"
 BUILD_CONFIGURATION="${SMM_CONFIGURATION:-debug}"
 PRIVATE_ENTITLEMENTS="${SMM_PRIVATE_ENTITLEMENTS:-0}"
+if [[ -x /opt/homebrew/opt/rust/bin/cargo ]]; then
+  CARGO_BIN=/opt/homebrew/opt/rust/bin/cargo
+  RUSTC_BIN=/opt/homebrew/opt/rust/bin/rustc
+else
+  CARGO_BIN="$(command -v cargo)"
+  RUSTC_BIN="$(command -v rustc)"
+fi
 
 cd "$PROJECT_ROOT"
 CLANG_MODULE_CACHE_PATH="$BUILD_ROOT/clang-cache" swift build \
@@ -29,15 +36,17 @@ CLANG_MODULE_CACHE_PATH="$BUILD_ROOT/clang-cache" swift build \
   --config-path "$BUILD_ROOT/config" \
   --security-path "$BUILD_ROOT/security"
 BIN_PATH="$(CLANG_MODULE_CACHE_PATH="$BUILD_ROOT/clang-cache" swift build -c "$BUILD_CONFIGURATION" --show-bin-path --disable-sandbox --cache-path "$BUILD_ROOT/cache" --config-path "$BUILD_ROOT/config" --security-path "$BUILD_ROOT/security")"
-cargo build --locked --release --manifest-path "$PROJECT_ROOT/rust-engine/Cargo.toml"
+RUSTC="$RUSTC_BIN" "$CARGO_BIN" build --locked --release --manifest-path "$PROJECT_ROOT/rust-engine/Cargo.toml"
 
 rm -rf "$APP_ROOT"
-mkdir -p "$APP_ROOT/Contents/MacOS" "$APP_ROOT/Contents/Resources" "$APP_ROOT/Contents/Frameworks" "$XPC_ROOT/Contents/MacOS" "$XPC_ROOT/Contents/Frameworks"
+mkdir -p "$APP_ROOT/Contents/MacOS" "$APP_ROOT/Contents/Helpers" "$APP_ROOT/Contents/Resources" "$APP_ROOT/Contents/Frameworks" "$XPC_ROOT/Contents/MacOS" "$XPC_ROOT/Contents/Frameworks"
 cp "$PROJECT_ROOT/Resources/App/Info.plist" "$APP_ROOT/Contents/Info.plist"
 cp "$PROJECT_ROOT/Resources/App/AppIcon.icns" "$APP_ROOT/Contents/Resources/AppIcon.icns"
 cp "$PROJECT_ROOT/Resources/EngineXPC/Info.plist" "$XPC_ROOT/Contents/Info.plist"
 cp "$BIN_PATH/SearchMyMac" "$APP_ROOT/Contents/MacOS/SearchMyMac"
+cp "$BIN_PATH/smm" "$APP_ROOT/Contents/Helpers/smm"
 cp "$BIN_PATH/SearchMyMacEngineService" "$XPC_ROOT/Contents/MacOS/SearchMyMacEngineService"
+cp "$PROJECT_ROOT/rust-engine/target/release/libsearchmymac_engine.dylib" "$APP_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
 cp "$PROJECT_ROOT/rust-engine/target/release/libsearchmymac_engine.dylib" "$XPC_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
 if [[ ! -d "$BIN_PATH/llama.framework" ]]; then
   echo "SwiftPM did not stage llama.framework beside the built executables." >&2
@@ -51,6 +60,7 @@ cp -R "$BIN_PATH/llama.framework" "$XPC_ROOT/Contents/Frameworks/llama.framework
 # before signing or dyld will abort before main() is reached.
 for EXECUTABLE in \
   "$APP_ROOT/Contents/MacOS/SearchMyMac" \
+  "$APP_ROOT/Contents/Helpers/smm" \
   "$XPC_ROOT/Contents/MacOS/SearchMyMacEngineService"; do
   install_name_tool -add_rpath "@executable_path/../Frameworks" "$EXECUTABLE"
   if ! otool -l "$EXECUTABLE" | grep -Fq "path @executable_path/../Frameworks"; then
@@ -94,9 +104,11 @@ fi
 /usr/libexec/PlistBuddy -c "Set :SMMAuthorizedClientRequirement $CLIENT_REQUIREMENT" "$XPC_ROOT/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :SMMEngineSigningRequirement $ENGINE_REQUIREMENT" "$APP_ROOT/Contents/Info.plist"
 
+codesign --force --sign "$SIGNING_IDENTITY" "$APP_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
 codesign --force --sign "$SIGNING_IDENTITY" "$XPC_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
 codesign --force --sign "$SIGNING_IDENTITY" "$APP_ROOT/Contents/Frameworks/llama.framework"
 codesign --force --sign "$SIGNING_IDENTITY" "$XPC_ROOT/Contents/Frameworks/llama.framework"
+codesign --force --sign "$SIGNING_IDENTITY" --identifier "com.searchmymac.cli" "$APP_ROOT/Contents/Helpers/smm"
 codesign --force --sign "$SIGNING_IDENTITY" --entitlements "$ENGINE_ENTITLEMENTS" "$XPC_ROOT"
 codesign --force --sign "$SIGNING_IDENTITY" --entitlements "$APP_ENTITLEMENTS" "$APP_ROOT"
 

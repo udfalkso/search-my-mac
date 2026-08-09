@@ -1,6 +1,67 @@
+import AppKit
 import Foundation
 import Testing
 @testable import SearchMyMacCore
+
+@Test func pinnedSavedSearchesPersistAndSortFirst() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("searchmymac-pinned-search-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try ManifestStore(databaseURL: directory.appendingPathComponent("manifest.sqlite3"))
+    let request = SearchRequest(query: "fixture")
+
+    try await store.saveSearch(SavedSearch(id: "alpha", name: "Alpha", request: request))
+    try await store.saveSearch(SavedSearch(id: "zulu", name: "Zulu", request: request, isPinned: true))
+
+    let searches = try await store.savedSearches()
+    #expect(searches.map(\.id) == ["zulu", "alpha"])
+    #expect(searches.first?.isPinned == true)
+}
+
+@Test func indexHealthSeparatesSemanticAndNonSemanticStorage() {
+    let health = IndexHealth(
+        databaseBytes: 2_000,
+        lexicalIndexBytes: 1_100,
+        semanticModelBytes: 600,
+        semanticIndexBytes: 100,
+        workingStorageBytes: 200
+    )
+    #expect(health.semanticStorageBytes == 700)
+    #expect(health.nonSemanticStorageBytes == 1_300)
+}
+
+@Test func semanticWorkContinuesAtReducedRateDuringTextIndexing() {
+    let contended = SemanticWorkSchedule(textIndexingIsActive: true)
+    let idle = SemanticWorkSchedule(textIndexingIsActive: false)
+    #expect(contended.batchSize == 4)
+    #expect(contended.interBatchDelay > .zero)
+    #expect(idle.batchSize > contended.batchSize)
+    #expect(idle.interBatchDelay == .zero)
+}
+
+@Test func extractionFailuresAreExposedAsActionableIndexIssues() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("searchmymac-index-issue-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try ManifestStore(databaseURL: directory.appendingPathComponent("manifest.sqlite3"))
+    let root = IndexRoot(id: "fixture", url: directory)
+    let fileURL = directory.appendingPathComponent("broken.pdf")
+    try await store.addRoot(root)
+    try await store.upsert(
+        file: DiscoveredFile(
+            sourceID: "broken", rootID: root.id, url: fileURL,
+            modifiedAt: nil, size: 10, availability: .available
+        ),
+        document: ExtractedDocument(
+            passages: [], availability: .extractionFailed, error: "PDFKit could not open the document"
+        )
+    )
+
+    let issues = try await store.indexIssues(limit: 10)
+    #expect(issues.count == 1)
+    #expect(issues.first?.url == fileURL)
+    #expect(issues.first?.message == "PDFKit could not open the document")
+}
 
 @Test func queryParserPreservesPhrasesPrefixesAndExclusions() throws {
     let parsed = try LexicalQueryParser().parse("\"quarterly report\" budget* -draft")
@@ -15,6 +76,87 @@ import Testing
     #expect(chunks.count >= 3)
     #expect(chunks[0].contains("word9"))
     #expect(chunks[1].contains("word8"))
+}
+
+@Test func hybridBalanceChangesReciprocalRankFusionPreference() {
+    func hit(id: String) -> SearchHit {
+        SearchHit(
+            id: id,
+            url: URL(fileURLWithPath: "/tmp/\(id).txt"),
+            filename: "\(id).txt",
+            path: "/tmp",
+            fileExtension: "txt",
+            modifiedAt: nil,
+            availability: .available,
+            score: 1,
+            snippets: [SearchSnippet(id: "\(id)-passage", text: "unrelated content")]
+        )
+    }
+
+    let lexical = SearchResponse(
+        requestID: UUID(), generation: 1, hits: [hit(id: "lexical")], effectiveMode: .text
+    )
+    let semantic = SearchResponse(
+        requestID: UUID(), generation: 1, hits: [hit(id: "semantic")], effectiveMode: .semantic
+    )
+
+    let textFocused = LocalSearchEngine.hybridResponse(
+        request: SearchRequest(query: "concept", mode: .hybrid, hybridSemanticWeight: 0.2),
+        lexical: lexical,
+        semantic: semantic
+    )
+    let meaningFocused = LocalSearchEngine.hybridResponse(
+        request: SearchRequest(query: "concept", mode: .hybrid, hybridSemanticWeight: 0.8),
+        lexical: lexical,
+        semantic: semantic
+    )
+
+    #expect(textFocused.hits.first?.id == "lexical")
+    #expect(meaningFocused.hits.first?.id == "semantic")
+}
+
+@MainActor
+@Test func standaloneImageTextFlowsThroughTheOCRPipeline() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("searchmymac-image-ocr-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let url = directory.appendingPathComponent("notice.png")
+    let representation = try #require(NSBitmapImageRep(
+        bitmapDataPlanes: nil, pixelsWide: 1_024, pixelsHigh: 512,
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+    ))
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: representation)
+    NSColor.white.setFill()
+    NSRect(x: 0, y: 0, width: 1_024, height: 512).fill()
+    NSString(string: "VISION SEARCH NOTICE").draw(
+        at: NSPoint(x: 35, y: 180),
+        withAttributes: [
+            .font: NSFont.systemFont(ofSize: 82, weight: .bold),
+            .foregroundColor: NSColor.black
+        ]
+    )
+    NSGraphicsContext.restoreGraphicsState()
+    let png = try #require(representation.representation(using: .png, properties: [:]))
+    try png.write(to: url)
+
+    let document = await DocumentExtractor(textRecognizer: StubOCRTextRecognizer()).extract(DiscoveredFile(
+        sourceID: "image", rootID: "fixture", url: url, modifiedAt: .now,
+        size: Int64(png.count), availability: .available
+    ))
+    #expect(document?.error == nil)
+    let text = try #require(document?.passages.map(\.text).joined(separator: " ").uppercased())
+    #expect(text.contains("VISION"))
+    #expect(text.contains("SEARCH"))
+    #expect(document?.passages.first?.locationKind == .image)
+}
+
+private struct StubOCRTextRecognizer: OCRTextRecognizing {
+    func recognizeText(in image: CGImage) async throws -> String {
+        "VISION SEARCH NOTICE"
+    }
 }
 
 @Test func discoveryPrunesGeneratedAndManagedContentButPreservesUserDocuments() throws {
@@ -51,7 +193,7 @@ import Testing
     ) == nil)
 }
 
-@Test func sourceCodeAndUserSelectedFoldersCanBeExcludedAndPurged() async throws {
+@Test func sourceCodeIsExcludedByDefaultAndCanBeIncludedOrPurged() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent("searchmymac-user-exclusions-test-\(UUID().uuidString)")
     let storage = directory.appendingPathComponent("index")
@@ -71,7 +213,13 @@ import Testing
     let engine = try LocalSearchEngine(storageURL: storage)
     let root = IndexRoot(id: "home", url: rootURL)
     try await engine.index(root: root)
+    #expect(try await engine.health().fileCount == 1)
+    #expect(try await engine.search(SearchRequest(query: "private code phrase")).hits.isEmpty)
+
+    try await engine.updateIndexingPreferences(IndexingPreferences(excludeSourceCode: false))
+    try await engine.index(root: root)
     #expect(try await engine.health().fileCount == 2)
+    #expect(try await engine.search(SearchRequest(query: "private code phrase")).hits.count == 1)
 
     try await engine.updateIndexingPreferences(IndexingPreferences(excludeSourceCode: true))
     #expect(try await engine.health().fileCount == 1)
@@ -97,7 +245,8 @@ import Testing
     try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
     try "package example".write(to: source, atomically: true, encoding: .utf8)
 
-    let files = try FileDiscovery().discover(root: IndexRoot(url: selectedRoot))
+    let files = try FileDiscovery(policy: DiscoveryPolicy(excludeSourceCode: false))
+        .discover(root: IndexRoot(url: selectedRoot))
     #expect(files.count == 1)
     #expect(files.first?.url.path.hasSuffix("/go/pkg/mod/github.com/example/package/source.go") == true)
 }
@@ -192,7 +341,10 @@ import Testing
         document: nil
     )
     let batch = try await store.purgeExcludedFilesBatch(
-        root: root, policy: DiscoveryPolicy(), afterRowID: 0, limit: 100
+        root: root,
+        policy: DiscoveryPolicy(excludeSourceCode: false),
+        afterRowID: 0,
+        limit: 100
     )
     #expect(batch.removed == 0)
     let database = try SQLiteDatabase(url: directory.appendingPathComponent("manifest.sqlite3"))
@@ -216,9 +368,174 @@ import Testing
     #expect(response.hits.count == 1)
     #expect(response.hits.first?.filename == "Budget Notes.txt")
     #expect(response.hits.first?.snippets.first?.text.contains("research allocation") == true)
+    try await engine.compactIndex()
+    #expect(try await engine.search(SearchRequest(query: "research allocation")).hits.count == 1)
     let progress = await engine.progress()
     #expect(progress.completed == progress.discovered)
     #expect(progress.fraction == 1)
+}
+
+@Test func readOnlyEngineSearchesWithoutRecordingHistory() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("searchmymac-read-only-engine-test-\(UUID().uuidString)")
+    let storage = root.appendingPathComponent("storage")
+    let documents = root.appendingPathComponent("documents")
+    try FileManager.default.createDirectory(at: documents, withIntermediateDirectories: true)
+    try "A private local search fixture.".write(
+        to: documents.appendingPathComponent("Fixture.txt"),
+        atomically: true,
+        encoding: .utf8
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let writer = try LocalSearchEngine(storageURL: storage)
+    try await writer.index(root: IndexRoot(id: "fixture", url: documents))
+    #expect(try await writer.history(limit: 10).isEmpty)
+
+    let reader = try LocalSearchEngine(storageURL: storage, readOnly: true)
+    let response = try await reader.search(SearchRequest(query: "private fixture"))
+    #expect(response.hits.first?.filename == "Fixture.txt")
+    #expect(try await writer.history(limit: 10).isEmpty)
+    await reader.shutdown()
+}
+
+@Test func contentMatchesRankAboveFilenameOnlyMatches() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("searchmymac-content-ranking-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try ManifestStore(databaseURL: directory.appendingPathComponent("manifest.sqlite3"))
+    let root = IndexRoot(id: "fixture", url: directory)
+    try await store.addRoot(root)
+
+    try await store.upsert(
+        file: DiscoveredFile(
+            sourceID: "filename-only", rootID: root.id,
+            url: directory.appendingPathComponent("Love Song.mp3"),
+            modifiedAt: nil, size: 10, availability: .filenameOnly
+        ),
+        document: nil
+    )
+    try await store.upsert(
+        file: DiscoveredFile(
+            sourceID: "content", rootID: root.id,
+            url: directory.appendingPathComponent("Research Notes.pdf"),
+            modifiedAt: nil, size: 100, availability: .available
+        ),
+        document: ExtractedDocument(passages: [
+            ExtractedPassage(
+                text: "People love products that make difficult work feel effortless.",
+                ordinal: 0,
+                locationKind: .page,
+                locationLabel: "Page 1"
+            )
+        ])
+    )
+
+    let response = try await store.search(SearchRequest(query: "love"))
+    #expect(response.hits.map(\.filename) == ["Research Notes.pdf", "Love Song.mp3"])
+    #expect((response.hits.first?.score ?? 0) > (response.hits.last?.score ?? 0))
+}
+
+@Test func multiTermCoverageOutranksRepetitionPlusAPathMatch() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("searchmymac-coverage-ranking-test-\(UUID().uuidString)")
+    let documents = directory.appendingPathComponent("Users/udi/Documents")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(at: documents, withIntermediateDirectories: true)
+    let store = try ManifestStore(databaseURL: directory.appendingPathComponent("manifest.sqlite3"))
+    let root = IndexRoot(id: "fixture", url: documents)
+    try await store.addRoot(root)
+
+    try await store.upsert(
+        file: DiscoveredFile(
+            sourceID: "repetition", rootID: root.id,
+            url: documents.appendingPathComponent("license.txt"),
+            modifiedAt: nil, size: 100, availability: .available
+        ),
+        document: ExtractedDocument(passages: [
+            ExtractedPassage(
+                text: Array(repeating: "license", count: 80).joined(separator: " "),
+                ordinal: 0, locationKind: .unknown, locationLabel: nil
+            )
+        ])
+    )
+    try await store.upsert(
+        file: DiscoveredFile(
+            sourceID: "complete", rootID: root.id,
+            url: documents.appendingPathComponent("Maryland ID.pdf"),
+            modifiedAt: nil, size: 100, availability: .available
+        ),
+        document: ExtractedDocument(
+            title: "Udi Maryland License",
+            passages: [ExtractedPassage(
+                text: "Maryland driver's license issued to Udi Falkson",
+                ordinal: 0, locationKind: .page, locationLabel: "Page 1"
+            )]
+        )
+    )
+
+    let response = try await store.search(SearchRequest(query: "udi license"))
+    #expect(response.hits.first?.filename == "Maryland ID.pdf")
+}
+
+@Test func nearbyMultiTermMatchesOutrankDistantMatches() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("searchmymac-proximity-ranking-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try ManifestStore(databaseURL: directory.appendingPathComponent("manifest.sqlite3"))
+    let root = IndexRoot(id: "fixture", url: directory)
+    try await store.addRoot(root)
+
+    let filler = Array(repeating: "unrelated", count: 160).joined(separator: " ")
+    try await store.upsert(
+        file: DiscoveredFile(
+            sourceID: "distant", rootID: root.id, url: directory.appendingPathComponent("A.txt"),
+            modifiedAt: nil, size: 100, availability: .available
+        ),
+        document: ExtractedDocument(passages: [
+            ExtractedPassage(
+                text: "udi \(filler) license license license license",
+                ordinal: 0, locationKind: .unknown, locationLabel: nil
+            )
+        ])
+    )
+    try await store.upsert(
+        file: DiscoveredFile(
+            sourceID: "nearby", rootID: root.id, url: directory.appendingPathComponent("B.txt"),
+            modifiedAt: nil, size: 100, availability: .available
+        ),
+        document: ExtractedDocument(passages: [
+            ExtractedPassage(
+                text: "udi license", ordinal: 0, locationKind: .unknown, locationLabel: nil
+            )
+        ])
+    )
+
+    let response = try await store.search(SearchRequest(query: "udi license"))
+    #expect(response.hits.first?.filename == "B.txt")
+}
+
+@Test func removingAnIndexedRootDeletesItsSearchDataWithoutTouchingOriginalFiles() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("searchmymac-remove-root-test-\(UUID().uuidString)")
+    let storage = directory.appendingPathComponent("index")
+    let documents = directory.appendingPathComponent("documents")
+    let original = documents.appendingPathComponent("keep-me.txt")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(at: documents, withIntermediateDirectories: true)
+    try "root removal fixture".write(to: original, atomically: true, encoding: .utf8)
+
+    let engine = try LocalSearchEngine(storageURL: storage)
+    let root = IndexRoot(id: "removable", url: documents)
+    try await engine.index(root: root)
+    #expect(try await engine.health().fileCount == 1)
+
+    try await engine.removeRoot(id: root.id)
+
+    #expect(try await engine.roots().isEmpty)
+    #expect(try await engine.health().fileCount == 0)
+    #expect(try await engine.search(SearchRequest(query: "fixture")).hits.isEmpty)
+    #expect(FileManager.default.fileExists(atPath: original.path))
 }
 
 @Test func vectorStorePersistsChecksumsTombstonesAndExactDelta() async throws {
@@ -293,6 +610,189 @@ import Testing
     #expect(response.effectiveMode == .semantic)
     #expect(response.hits.first?.filename == "Strategy.md")
     #expect(abs((response.hits.first?.score ?? 0) - 0.91) < 0.000_001)
+}
+
+@Test func semanticSearchSuppressesUnrequestedImageOCRWithoutDiscardingDocumentNeighbors() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("searchmymac-semantic-quality-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try ManifestStore(databaseURL: directory.appendingPathComponent("manifest.sqlite3"))
+    let root = IndexRoot(id: "fixture", url: directory)
+    try await store.addRoot(root)
+
+    try await store.upsert(
+        file: DiscoveredFile(
+            sourceID: "image", rootID: root.id, url: directory.appendingPathComponent("Screenshot.png"),
+            modifiedAt: nil, size: 10, availability: .available
+        ),
+        document: ExtractedDocument(passages: [
+            ExtractedPassage(text: "Unrelated menu chrome", ordinal: 0, locationKind: .image, locationLabel: nil)
+        ])
+    )
+    try await store.upsert(
+        file: DiscoveredFile(
+            sourceID: "document", rootID: root.id, url: directory.appendingPathComponent("Home.pdf"),
+            modifiedAt: nil, size: 10, availability: .available
+        ),
+        document: ExtractedDocument(passages: [
+            ExtractedPassage(text: "Mortgage planning notes", ordinal: 0, locationKind: .page, locationLabel: "Page 1")
+        ])
+    )
+
+    let pending = try await store.nextSemanticPassages(modelID: "fixture-model", limit: 10)
+    let keys = Dictionary(uniqueKeysWithValues: pending.map { ($0.filename, $0.id) })
+    let imageKey = try #require(keys["Screenshot.png"])
+    let documentKey = try #require(keys["Home.pdf"])
+
+    let defaultResponse = try await store.semanticSearchResponse(
+        matches: [VectorMatch(key: imageKey, score: 0.68), VectorMatch(key: documentKey, score: 0.49)],
+        request: SearchRequest(query: "home buying", mode: .semantic)
+    )
+    #expect(defaultResponse.hits.map(\.filename) == ["Home.pdf"])
+
+    let imageResponse = try await store.semanticSearchResponse(
+        matches: [VectorMatch(key: imageKey, score: 0.68)],
+        request: SearchRequest(query: "home buying", mode: .semantic, filters: SearchFilters(extensions: ["png"]))
+    )
+    #expect(imageResponse.hits.map(\.filename) == ["Screenshot.png"])
+
+    let weakResponse = try await store.semanticSearchResponse(
+        matches: [VectorMatch(key: documentKey, score: 0.45)],
+        request: SearchRequest(query: "home buying", mode: .semantic)
+    )
+    #expect(weakResponse.hits.map(\.filename) == ["Home.pdf"])
+}
+
+@Test func semanticDocumentInputPreservesTitleAndNumericInformation() {
+    let input = SemanticModelDescriptor.documentInput(
+        filename: "Cash to Close.pdf",
+        passage: "Mortgage estimate: 855,000 at 4.375% over 30 years"
+    )
+    #expect(input.contains("Document title: Cash to Close.pdf"))
+    #expect(input.contains("Mortgage estimate:"))
+    #expect(input.contains("855,000"))
+    #expect(input.contains("4.375%"))
+}
+
+@Test func rerankerMortgageSpikeWhenRequested() throws {
+    guard let path = ProcessInfo.processInfo.environment["SMM_RERANKER_MODEL_PATH"] else { return }
+    let model = try QwenRerankerModel(url: URL(fileURLWithPath: path), useGPU: false, suppressLogs: true)
+    defer { model.shutdown() }
+    let document = "Falkson and Davis 4600 Overbrook Road $1.5M and $700k to close MoCo MD.pdf. Prosperity Home Mortgage Estimate of Cash to Close and Monthly Payment. Mortgage loan, closing costs, residential real property purchase, loan amount, sales price, lender fees, title insurance, homeowner insurance, and cash to close."
+    let score = try model.score(query: "home buying related", document: document)
+    let card = "Document topic: home purchase and residential real-estate transaction. This document is a mortgage financing and closing-cost estimate for buying a home. File: Falkson and Davis 4600 Overbrook Road $1.5M and $700k to close MoCo MD.pdf. Concepts: home buying, home purchase, mortgage loan, financing, cash to close, monthly payment, closing costs, sale price, title insurance, homeowner insurance, property address."
+    let cardScore = try model.score(query: "home buying related", document: card)
+    let control = try model.score(query: "What is the capital of China?", document: "The capital of China is Beijing.")
+    print("Mortgage passage relevance: \(score) | document-card relevance: \(cardScore) | control relevance: \(control)")
+    #expect(control > score)
+}
+
+@Test func embedding4BMortgageSpikeWhenRequested() throws {
+    guard let path = ProcessInfo.processInfo.environment["SMM_EMBEDDING_4B_MODEL_PATH"] else { return }
+    let model = try QwenEmbeddingModel(
+        url: URL(fileURLWithPath: path), dimensions: 2_560, useGPU: false, suppressLogs: true
+    )
+    defer { model.shutdown() }
+    let query = try model.embedQuery("home buying related")
+    let passage = "Prosperity Home Mortgage Estimate of Cash to Close and Monthly Payment. Mortgage loan, closing costs, residential real property purchase, lender fees, title insurance, homeowner insurance, and cash to close."
+    let card = "Document topic: home purchase and residential real-estate transaction. This document is a mortgage financing and closing-cost estimate for buying a home. Concepts: home buying, home purchase, mortgage loan, financing, cash to close, monthly payment, closing costs, sale price, title insurance, homeowner insurance."
+    func cosine(_ value: [Float]) -> Float { zip(query, value).reduce(0) { $0 + $1.0 * $1.1 } }
+    let passageScore = cosine(try model.embedDocument(passage))
+    let cardScore = cosine(try model.embedDocument(card))
+    print("4B embedding cosine | passage: \(passageScore) | document card: \(cardScore)")
+    #expect(cardScore > passageScore)
+}
+
+@Test func semanticNormalizationPreservesStructuredData() {
+    let normalized = SemanticModelDescriptor.normalizedPassageForEmbedding(
+        "Qwen3 forecast | Revenue: $1,500,000 | Growth: 24.5% | FY2026"
+    )
+    #expect(normalized.contains("Qwen3 forecast"))
+    #expect(normalized.contains("Revenue:"))
+    #expect(normalized.contains("Growth:"))
+    #expect(normalized.contains("1,500,000"))
+    #expect(normalized.contains("24.5%"))
+    #expect(normalized.contains("2026"))
+}
+
+@Test func semanticQueuePrioritizesRecentProseAndDiversifiesAcrossFiles() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("searchmymac-semantic-priority-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try ManifestStore(databaseURL: directory.appendingPathComponent("manifest.sqlite3"))
+    let root = IndexRoot(id: "fixture", url: directory)
+    try await store.addRoot(root)
+
+    func addFile(
+        id: String,
+        filename: String,
+        modifiedAt: TimeInterval,
+        passages: [String]
+    ) async throws {
+        try await store.upsert(
+            file: DiscoveredFile(
+                sourceID: id,
+                rootID: root.id,
+                url: directory.appendingPathComponent(filename),
+                modifiedAt: Date(timeIntervalSince1970: modifiedAt),
+                size: 100,
+                availability: .available
+            ),
+            document: ExtractedDocument(passages: passages.enumerated().map { ordinal, text in
+                ExtractedPassage(
+                    text: text,
+                    ordinal: ordinal,
+                    locationKind: .unknown,
+                    locationLabel: nil
+                )
+            })
+        )
+    }
+
+    try await addFile(
+        id: "newest-prose",
+        filename: "Newest Notes.md",
+        modifiedAt: 400,
+        passages: ["newest first section", "newest second section"]
+    )
+    try await addFile(
+        id: "recent-prose",
+        filename: "Recent Report.pdf",
+        modifiedAt: 300,
+        passages: ["recent report"]
+    )
+    try await addFile(
+        id: "old-prose",
+        filename: "Old Notes.txt",
+        modifiedAt: 100,
+        passages: ["old notes"]
+    )
+    try await addFile(
+        id: "newest-sheet",
+        filename: "Newest Workbook.xlsx",
+        modifiedAt: 600,
+        passages: ["spreadsheet cells"]
+    )
+    try await addFile(
+        id: "newer-csv",
+        filename: "Newer Export.csv",
+        modifiedAt: 500,
+        passages: ["tabular export"]
+    )
+
+    let firstBatch = try await store.nextSemanticPassages(modelID: "fixture-model", limit: 5)
+    #expect(firstBatch.map(\.filename) == [
+        "Newest Notes.md",
+        "Recent Report.pdf",
+        "Old Notes.txt",
+        "Newest Workbook.xlsx",
+        "Newer Export.csv"
+    ])
+    #expect(firstBatch.filter { $0.filename == "Newest Notes.md" }.count == 1)
+
+    try await store.markPassageEmbedded(id: firstBatch[0].id, modelID: "fixture-model")
+    let next = try await store.nextSemanticPassages(modelID: "fixture-model", limit: 1)
+    #expect(next.first?.filename == "Recent Report.pdf")
 }
 
 @Test func qwenEmbeddingRuntimeSmokeTestWhenModelIsProvided() throws {
@@ -429,4 +929,54 @@ import Testing
     #expect(history.count == 1)
     #expect(history.first?.mode == .hybrid)
     #expect(history.first?.query == "  JOANNA  ")
+}
+
+@Test func lexicalJournalTracksTheLatestDurableSourceOperation() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("searchmymac-lexical-journal-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try ManifestStore(databaseURL: directory.appendingPathComponent("manifest.sqlite3"))
+    let root = IndexRoot(id: "docs", url: directory)
+    let url = directory.appendingPathComponent("Maryland License.txt")
+    try await store.addRoot(root)
+    try await store.upsert(
+        file: DiscoveredFile(sourceID: "license", rootID: root.id, url: url, modifiedAt: .now, size: 10, availability: .available),
+        document: ExtractedDocument(passages: [ExtractedPassage(text: "Udi Maryland license", ordinal: 0, locationKind: .unknown, locationLabel: nil)])
+    )
+    let upserts = try await store.lexicalOperations(after: -1)
+    #expect(upserts.count == 1)
+    #expect(upserts.first?.kind == .upsert)
+    let document = try #require(await store.lexicalDocument(sourceID: "license"))
+    #expect(document.input.rootID == "docs")
+    #expect(document.input.passages.first?.body == "Udi Maryland license")
+
+    try await store.removeFile(atPath: url.path, rootID: root.id)
+    let deletes = try await store.lexicalOperations(after: -1)
+    #expect(deletes.count == 1)
+    #expect(deletes.first?.kind == .delete)
+    let currentGeneration = try await store.generation()
+    #expect(deletes.first?.generation == currentGeneration)
+}
+
+@Test func bundledTantivyBridgeRanksCoverageAndAppliesFilters() throws {
+    guard ProcessInfo.processInfo.environment["SMM_TANTIVY_LIBRARY_PATH"] != nil else { return }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("searchmymac-tantivy-bridge-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let bridge = try #require(TantivyEngineBridge(indexURL: directory))
+    try bridge.upsert(TantivyDocumentInput(
+        sourceID: "repetition", generation: 1, filename: "license.txt", title: "License", path: "/Users/test/license.txt",
+        modifiedAt: 1, availability: "available", rootID: "docs", extension: "txt",
+        passages: [TantivyPassageInput(passageID: 1, body: String(repeating: "license ", count: 30))]
+    ))
+    try bridge.upsert(TantivyDocumentInput(
+        sourceID: "maryland", generation: 1, filename: "Maryland License.pdf", title: "Udi Maryland License",
+        path: "/Users/test/Maryland License.pdf", modifiedAt: 2, availability: "available", rootID: "docs", extension: "pdf",
+        passages: [TantivyPassageInput(passageID: 2, body: "UDI Maryland driver's license")]
+    ))
+    try bridge.commit(generation: 1)
+    #expect(try bridge.committedGeneration() == 1)
+    let ranked = try bridge.search(SearchRequest(query: "udi license"), offset: 0)
+    #expect(ranked.hits.first?.sourceID == "maryland")
+    let filtered = try bridge.search(SearchRequest(query: "udi license", filters: SearchFilters(extensions: ["txt"])), offset: 0)
+    #expect(filtered.hits.isEmpty)
 }

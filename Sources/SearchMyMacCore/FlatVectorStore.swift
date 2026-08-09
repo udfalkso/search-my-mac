@@ -32,38 +32,48 @@ public actor FlatVectorStore {
     private let dataURL: URL
     private let manifestURL: URL
     private let journalURL: URL
+    private let isReadOnly: Bool
     private var records: [UInt64: StoredVector] = [:]
 
-    public init(directory: URL) throws {
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        dataURL = directory.appendingPathComponent("vectors.f16")
-        manifestURL = directory.appendingPathComponent("vectors.json")
-        journalURL = directory.appendingPathComponent("vectors.manifest.jsonl")
-        if !FileManager.default.fileExists(atPath: dataURL.path) {
+    public init(directory: URL, readOnly: Bool = false) throws {
+        isReadOnly = readOnly
+        if !readOnly {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
+        let dataURL = directory.appendingPathComponent("vectors.f16")
+        let manifestURL = directory.appendingPathComponent("vectors.json")
+        let journalURL = directory.appendingPathComponent("vectors.manifest.jsonl")
+        self.dataURL = dataURL
+        self.manifestURL = manifestURL
+        self.journalURL = journalURL
+        if !readOnly && !FileManager.default.fileExists(atPath: dataURL.path) {
             _ = FileManager.default.createFile(atPath: dataURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
         }
+        var loadedRecords: [UInt64: StoredVector] = [:]
         if let data = try? Data(contentsOf: manifestURL) {
             let decoded = try JSONDecoder().decode([StoredVector].self, from: data)
-            records = Dictionary(uniqueKeysWithValues: decoded.map { ($0.key, $0) })
+            loadedRecords = Dictionary(uniqueKeysWithValues: decoded.map { ($0.key, $0) })
         }
         if let journal = try? String(contentsOf: journalURL, encoding: .utf8) {
             for line in journal.split(separator: "\n") {
                 guard let data = line.data(using: .utf8),
                       let record = try? JSONDecoder().decode(StoredVector.self, from: data) else { continue }
-                records[record.key] = record
+                loadedRecords[record.key] = record
             }
         }
-        if !FileManager.default.fileExists(atPath: journalURL.path) {
+        records = loadedRecords
+        if !readOnly && !FileManager.default.fileExists(atPath: journalURL.path) {
             _ = FileManager.default.createFile(atPath: journalURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
         }
     }
 
     @discardableResult
     public func append(key: UInt64, vector: [Float]) throws -> StoredVector {
+        guard !isReadOnly else { throw SearchMyMacError.semantic("The vector index was opened read-only.") }
         let payload = vector.withUnsafeBufferPointer { values -> Data in
             var halves = values.map { Float16($0).bitPattern.littleEndian }
             return halves.withUnsafeMutableBytes { Data($0) }
@@ -100,6 +110,7 @@ public actor FlatVectorStore {
     }
 
     public func tombstone(key: UInt64) throws {
+        guard !isReadOnly else { throw SearchMyMacError.semantic("The vector index was opened read-only.") }
         guard var record = records[key] else { return }
         record.tombstoned = true
         records[key] = record
@@ -111,6 +122,7 @@ public actor FlatVectorStore {
     }
 
     public func clear() throws {
+        guard !isReadOnly else { throw SearchMyMacError.semantic("The vector index was opened read-only.") }
         records.removeAll()
         try Data().write(to: dataURL, options: [.atomic])
         try Data().write(to: journalURL, options: [.atomic])

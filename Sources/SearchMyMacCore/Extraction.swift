@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import Foundation
+import ImageIO
 import PDFKit
 import Vision
 
@@ -46,6 +47,24 @@ public struct ExtractionLimits: Sendable {
     public init() {}
 }
 
+protocol OCRTextRecognizing: Sendable {
+    func recognizeText(in image: CGImage) async throws -> String
+}
+
+struct VisionOCRTextRecognizer: OCRTextRecognizing {
+    func recognizeText(in image: CGImage) async throws -> String {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+        request.automaticallyDetectsLanguage = true
+        request.preferBackgroundProcessing = true
+        try VNImageRequestHandler(cgImage: image).perform([request])
+        return request.results?
+            .compactMap { $0.topCandidates(1).first?.string }
+            .joined(separator: "\n") ?? ""
+    }
+}
+
 public struct DocumentExtractor: Sendable {
     public static let supportedExtensions: Set<String> = [
         "txt", "text", "md", "markdown", "csv", "tsv", "json", "jsonl", "xml", "yaml", "yml",
@@ -53,15 +72,31 @@ public struct DocumentExtractor: Sendable {
         "pdf", "pages", "numbers", "key", "ppt", "pptx", "odp", "xls", "xlsx", "xlsb", "ods",
         "epub", "eml", "emlx", "swift", "m", "mm", "h", "hpp", "c", "cc", "cpp", "rs", "go",
         "py", "rb", "js", "jsx", "ts", "tsx", "java", "kt", "kts", "sh", "bash", "zsh", "fish",
-        "sql", "css", "scss", "less", "tex"
+        "sql", "css", "scss", "less", "tex",
+        "jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "bmp", "gif", "webp"
+    ]
+    public static let imageExtensions: Set<String> = [
+        "jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "bmp", "gif", "webp"
     ]
 
     private let limits: ExtractionLimits
     private let chunker: PassageChunker
+    private let textRecognizer: any OCRTextRecognizing
 
     public init(limits: ExtractionLimits = .init(), chunker: PassageChunker = .init()) {
         self.limits = limits
         self.chunker = chunker
+        textRecognizer = VisionOCRTextRecognizer()
+    }
+
+    init(
+        limits: ExtractionLimits = .init(),
+        chunker: PassageChunker = .init(),
+        textRecognizer: any OCRTextRecognizing
+    ) {
+        self.limits = limits
+        self.chunker = chunker
+        self.textRecognizer = textRecognizer
     }
 
     public func extract(_ file: DiscoveredFile) async -> ExtractedDocument? {
@@ -76,6 +111,8 @@ public struct DocumentExtractor: Sendable {
             switch ext {
             case "pdf":
                 return try await extractPDF(file.url)
+            case _ where Self.imageExtensions.contains(ext):
+                return try await extractImage(file.url)
             case "rtf", "rtfd", "doc", "docx", "odt", "html", "htm":
                 return try extractAttributedDocument(file.url, extension: ext)
             case "pages", "numbers", "key", "ppt", "pptx", "odp", "xls", "xlsx", "xlsb", "ods", "epub":
@@ -121,6 +158,42 @@ public struct DocumentExtractor: Sendable {
         }
         return ExtractedDocument(
             title: document.documentAttributes?[PDFDocumentAttribute.titleAttribute] as? String,
+            passages: passages,
+            availability: passages.isEmpty ? .filenameOnly : .available
+        )
+    }
+
+    private func extractImage(_ url: URL) async throws -> ExtractedDocument {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            throw SearchMyMacError.extraction("ImageIO could not open the image")
+        }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: Int(limits.OCRMaximumDimension),
+            kCGImageSourceShouldCacheImmediately: true
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            throw SearchMyMacError.extraction("ImageIO could not decode the image")
+        }
+        guard hasMeaningfulInk(image) else {
+            return ExtractedDocument(passages: [], availability: .filenameOnly)
+        }
+        let text = try await textRecognizer.recognizeText(in: image)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            return ExtractedDocument(passages: [], availability: .filenameOnly)
+        }
+        let passages = chunker.chunk(String(text.prefix(limits.maximumExtractedCharacters))).enumerated().map {
+            ExtractedPassage(
+                text: $0.element,
+                ordinal: $0.offset,
+                locationKind: .image,
+                locationLabel: nil
+            )
+        }
+        return ExtractedDocument(
+            title: url.deletingPathExtension().lastPathComponent,
             passages: passages,
             availability: passages.isEmpty ? .filenameOnly : .available
         )
@@ -241,39 +314,37 @@ public struct DocumentExtractor: Sendable {
         let size = CGSize(width: max(bounds.width * scale, 1), height: max(bounds.height * scale, 1))
         let image = page.thumbnail(of: size, for: .mediaBox)
         guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return "" }
-        return try await withCheckedThrowingContinuation { continuation in
-            let request = VNRecognizeTextRequest { request, error in
-                if let error { continuation.resume(throwing: error); return }
-                let text = (request.results as? [VNRecognizedTextObservation])?
-                    .compactMap { $0.topCandidates(1).first?.string }
-                    .joined(separator: "\n") ?? ""
-                continuation.resume(returning: text)
-            }
-            request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = true
-            do {
-                try VNImageRequestHandler(cgImage: cgImage).perform([request])
-            } catch {
-                continuation.resume(throwing: error)
-            }
-        }
+        return try await textRecognizer.recognizeText(in: cgImage)
     }
 
     private func hasMeaningfulInk(_ page: PDFPage) -> Bool {
         let size = CGSize(width: 192, height: 192)
         let image = page.thumbnail(of: size, for: .mediaBox)
-        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
-              let data = cgImage.dataProvider?.data,
-              let bytes = CFDataGetBytePtr(data) else { return false }
-        let length = CFDataGetLength(data)
-        guard length > 4 else { return false }
-        let stride = max(cgImage.bitsPerPixel / 8, 1)
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return false }
+        return hasMeaningfulInk(cgImage)
+    }
+
+    private func hasMeaningfulInk(_ image: CGImage) -> Bool {
+        let maximumSide = 128
+        let scale = min(Double(maximumSide) / Double(max(image.width, image.height)), 1)
+        let width = max(1, Int(Double(image.width) * scale))
+        let height = max(1, Int(Double(image.height) * scale))
+        var pixels = [UInt8](repeating: 255, count: width * height * 4)
+        guard let context = CGContext(
+            data: &pixels, width: width, height: height, bitsPerComponent: 8,
+            bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return false }
+        context.setFillColor(CGColor(gray: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.interpolationQuality = .medium
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
         var nonWhite = 0
         var samples = 0
-        for index in Swift.stride(from: 0, to: length - stride, by: stride * 16) {
-            let red = Int(bytes[index])
-            let green = stride > 1 ? Int(bytes[index + 1]) : red
-            let blue = stride > 2 ? Int(bytes[index + 2]) : red
+        for index in Swift.stride(from: 0, to: pixels.count - 3, by: 4) {
+            let red = Int(pixels[index])
+            let green = Int(pixels[index + 1])
+            let blue = Int(pixels[index + 2])
             if min(red, green, blue) < 242 { nonWhite += 1 }
             samples += 1
         }

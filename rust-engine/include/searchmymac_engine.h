@@ -15,6 +15,9 @@ void smm_engine_release(SMMEngine *engine);
 char *smm_engine_upsert(SMMEngine *engine, const char *json);
 char *smm_engine_delete(SMMEngine *engine, const char *source_id);
 char *smm_engine_commit(SMMEngine *engine);
+char *smm_engine_commit_generation(SMMEngine *engine, long long generation);
+char *smm_engine_committed_generation(SMMEngine *engine);
+char *smm_engine_reset(SMMEngine *engine);
 char *smm_engine_search(SMMEngine *engine, const char *json);
 void smm_string_free(char *value);
 

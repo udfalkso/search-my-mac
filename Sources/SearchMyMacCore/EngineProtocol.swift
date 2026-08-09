@@ -7,6 +7,8 @@ public protocol SearchEngine: Sendable {
     func resume() async
     func progress() async -> IndexProgress
     func health() async throws -> IndexHealth
+    func indexIssues(limit: Int) async throws -> [IndexIssue]
+    func retryFailedExtractions() async throws
     func indexingPreferences() async throws -> IndexingPreferences
     func updateIndexingPreferences(_ preferences: IndexingPreferences) async throws
     func folderUsage(limit: Int) async throws -> [IndexFolderUsage]
@@ -27,6 +29,7 @@ public protocol SearchEngine: Sendable {
     func deleteSavedSearch(id: String) async throws
     func startMonitoring() async throws
     func stopMonitoring() async
+    func shutdown() async
 }
 
 public enum SearchMyMacError: LocalizedError, Sendable {

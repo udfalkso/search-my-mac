@@ -7,6 +7,8 @@ let package = Package(
     products: [
         .library(name: "SearchMyMacCore", targets: ["SearchMyMacCore"]),
         .executable(name: "SearchMyMac", targets: ["SearchMyMacApp"]),
+        .executable(name: "smm", targets: ["SearchMyMacCLI"]),
+        .executable(name: "semantic-benchmark", targets: ["SemanticBenchmark"]),
         .executable(name: "SearchMyMacEngineService", targets: ["SearchMyMacEngineService"])
     ],
     dependencies: [
@@ -36,6 +38,14 @@ let package = Package(
                 .linkedFramework("QuickLookUI"),
                 .linkedFramework("ServiceManagement")
             ]
+        ),
+        .executableTarget(
+            name: "SearchMyMacCLI",
+            dependencies: ["SearchMyMacCore"]
+        ),
+        .executableTarget(
+            name: "SemanticBenchmark",
+            dependencies: ["SearchMyMacCore"]
         ),
         .executableTarget(
             name: "SearchMyMacEngineService",

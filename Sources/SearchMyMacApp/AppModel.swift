@@ -7,7 +7,11 @@ import ServiceManagement
 @MainActor
 final class AppModel: ObservableObject {
     @Published var query = ""
-    @Published var mode: SearchMode = .text
+    @Published var mode: SearchMode {
+        didSet {
+            UserDefaults.standard.set(mode.rawValue, forKey: Self.preferredSearchModeKey)
+        }
+    }
     @Published var filters = SearchFilters()
     @Published var results: [SearchHit] = []
     @Published var effectiveMode: SearchMode = .text
@@ -16,21 +20,34 @@ final class AppModel: ObservableObject {
     @Published var savedSearches: [SavedSearch] = []
     @Published var progress = IndexProgress()
     @Published var health = IndexHealth()
-    @Published var selectedHitID: SearchHit.ID?
+    @Published var indexIssues: [IndexIssue] = []
+    /// UI selection is path-based so separate files with the same display name
+    /// always remain independently selectable.
+    @Published var selectedHitPath: String?
     @Published var errorMessage: String?
     @Published var isSearching = false
+    /// Kept separate from request activity so the first results can arrive only
+    /// after the loading indicator has had a chance to fade away.
+    @Published var showsSearchSpinner = false
     @Published var indexingRate: Double = 0
     @Published var launchAtLogin = false
     @Published var historyRecordingEnabled = true
     @Published var semanticStatus = SemanticStatus()
+    @Published var hybridSemanticWeight: Double
     @Published var hasLoadedInitialState = false
     @Published var indexingPreferences = IndexingPreferences()
     @Published var folderUsage: [IndexFolderUsage] = []
     @Published var isUpdatingIndexRules = false
     @Published var isCompactingIndex = false
+    @Published var isRemovingLocations = false
+    @Published var isRetryingIndexIssues = false
 
     private let engine: LocalSearchEngine?
     private var searchTask: Task<Void, Never>?
+    /// Changes for every request so an older asynchronous result can never
+    /// repaint the UI after a newer query, mode, or filter selection.
+    private var activeSearchID: UUID?
+    private var startupTask: Task<Void, Never>?
     private var indexTask: Task<Void, Never>?
     private var progressTask: Task<Void, Never>?
     private var reconciliationTask: Task<Void, Never>?
@@ -39,8 +56,14 @@ final class AppModel: ObservableObject {
     private var indexingWorkActive = false
     private var indexOperationID: UUID?
     private var progressSample: (date: Date, completed: Int)?
+    private static let preferredSearchModeKey = "preferredSearchMode"
+    private static let hybridSemanticWeightKey = "hybridSemanticWeight"
 
     init() {
+        mode = UserDefaults.standard.string(forKey: Self.preferredSearchModeKey)
+            .flatMap(SearchMode.init(rawValue:)) ?? .text
+        let storedHybridWeight = UserDefaults.standard.object(forKey: Self.hybridSemanticWeightKey) as? Double
+        hybridSemanticWeight = min(max(storedHybridWeight ?? SearchRequest.defaultHybridSemanticWeight, 0), 1)
         do {
             engine = try LocalSearchEngine()
         } catch {
@@ -49,12 +72,21 @@ final class AppModel: ObservableObject {
         }
         launchAtLogin = SMAppService.mainApp.status == .enabled
         historyRecordingEnabled = UserDefaults.standard.object(forKey: "historyRecordingEnabled") as? Bool ?? true
-        Task {
+        startupTask = Task {
             await engine?.setApplicationIsActive(NSApplication.shared.isActive)
             await engine?.setHistoryRecording(historyRecordingEnabled)
             await refreshAll()
             hasLoadedInitialState = true
-            do { try await engine?.resumeSemanticIndexing() }
+            do {
+                try await engine?.resumeSemanticIndexing()
+                if let engine {
+                    semanticStatus = await engine.semanticStatus()
+                    if UserDefaults.standard.string(forKey: Self.preferredSearchModeKey) == nil,
+                       semanticStatus.phase != .notInstalled {
+                        mode = .hybrid
+                    }
+                }
+            }
             catch { errorMessage = error.localizedDescription }
             if !roots.isEmpty { await reconcileRoots() }
             do { try await engine?.startMonitoring() }
@@ -86,25 +118,70 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func scheduleSearch() {
+    func shutdown() async {
+        let activeTasks = [
+            startupTask, searchTask, indexTask, progressTask,
+            reconciliationTask, semanticProgressTask
+        ].compactMap { $0 }
+        activeTasks.forEach { $0.cancel() }
+        for task in activeTasks { await task.value }
+        startupTask = nil
+        searchTask = nil
+        indexTask = nil
+        progressTask = nil
+        reconciliationTask = nil
+        semanticProgressTask = nil
+        await engine?.shutdown()
+    }
+
+    func scheduleSearch(immediately: Bool = false, clearingResults: Bool = false) {
         searchTask?.cancel()
+        let searchID = UUID()
+        activeSearchID = searchID
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             results = []
+            selectedHitPath = nil
+            isSearching = false
+            showsSearchSpinner = false
             return
+        }
+        if clearingResults {
+            results = []
+            selectedHitPath = nil
         }
         let querySnapshot = query
         let modeSnapshot = mode
         let filterSnapshot = filters
+        let hybridSemanticWeightSnapshot = hybridSemanticWeight
+        isSearching = true
+        showsSearchSpinner = results.isEmpty
         searchTask = Task {
-            try? await Task.sleep(for: .milliseconds(120))
-            guard !Task.isCancelled, let engine else { return }
+            if !immediately {
+                try? await Task.sleep(for: .milliseconds(120))
+            }
+            guard !Task.isCancelled, activeSearchID == searchID, let engine else { return }
             isSearching = true
-            defer { isSearching = false }
+            defer {
+                if activeSearchID == searchID {
+                    isSearching = false
+                    showsSearchSpinner = false
+                }
+            }
             do {
                 let response = try await engine.search(
-                    SearchRequest(query: querySnapshot, mode: modeSnapshot, filters: filterSnapshot)
+                    SearchRequest(
+                        query: querySnapshot,
+                        mode: modeSnapshot,
+                        filters: filterSnapshot,
+                        hybridSemanticWeight: hybridSemanticWeightSnapshot
+                    )
                 )
-                guard !Task.isCancelled, query == querySnapshot else { return }
+                guard !Task.isCancelled, activeSearchID == searchID else { return }
+                if showsSearchSpinner {
+                    showsSearchSpinner = false
+                    try? await Task.sleep(for: .milliseconds(110))
+                    guard !Task.isCancelled, activeSearchID == searchID else { return }
+                }
                 results = response.hits
                 effectiveMode = response.effectiveMode
                 history = try await engine.history(limit: 100)
@@ -117,14 +194,22 @@ final class AppModel: ObservableObject {
     func useHistory(_ entry: SearchHistoryEntry) {
         query = entry.query
         mode = entry.mode
-        scheduleSearch()
+        scheduleSearch(immediately: true, clearingResults: true)
     }
 
     func useSavedSearch(_ saved: SavedSearch) {
         query = saved.request.query
         mode = saved.request.mode
         filters = saved.request.filters
-        scheduleSearch()
+        hybridSemanticWeight = saved.request.hybridSemanticWeight
+        scheduleSearch(immediately: true, clearingResults: true)
+    }
+
+    func updateHybridSemanticWeight(_ weight: Double) {
+        let clamped = min(max(weight, 0), 1)
+        hybridSemanticWeight = clamped
+        UserDefaults.standard.set(clamped, forKey: Self.hybridSemanticWeightKey)
+        if mode == .hybrid { scheduleSearch() }
     }
 
     func indexEntireHome() {
@@ -187,10 +272,44 @@ final class AppModel: ObservableObject {
     }
 
     func removeRoot(_ root: IndexRoot) {
-        guard let engine else { return }
+        removeRoots([root])
+    }
+
+    func removeAllRoots() {
+        removeRoots(roots)
+    }
+
+    private func removeRoots(_ rootsToRemove: [IndexRoot]) {
+        guard let engine, !rootsToRemove.isEmpty, !isRemovingLocations else { return }
+        let previousIndexTask = indexTask
+        previousIndexTask?.cancel()
+        isRemovingLocations = true
         Task {
-            do { try await engine.removeRoot(id: root.id); await refreshAll() }
-            catch { errorMessage = error.localizedDescription }
+            defer { isRemovingLocations = false }
+            await previousIndexTask?.value
+            do {
+                for root in rootsToRemove {
+                    try await engine.removeRoot(id: root.id)
+                }
+                let removedIDs = Set(rootsToRemove.map(\.id))
+                filters.rootIDs.subtract(removedIDs)
+                filters.pathPrefixes = Set(filters.pathPrefixes.filter { prefix in
+                    !rootsToRemove.contains { root in
+                        let rootPath = root.url.standardizedFileURL.path
+                        return prefix == rootPath || prefix.hasPrefix(rootPath + "/")
+                    }
+                })
+                await refreshAll()
+                if roots.isEmpty {
+                    filters = SearchFilters()
+                    results = []
+                    selectedHitPath = nil
+                } else if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    scheduleSearch()
+                }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -243,12 +362,32 @@ final class AppModel: ObservableObject {
             async let preferencesValue = engine.indexingPreferences()
             async let usageValue = engine.folderUsage(limit: 20)
             async let healthValue = engine.health()
+            async let issuesValue = engine.indexIssues(limit: 100)
             indexingPreferences = try await preferencesValue
             folderUsage = try await usageValue
             health = try await healthValue
+            indexIssues = try await issuesValue
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    func retryFailedExtractions() {
+        guard let engine, !isRetryingIndexIssues else { return }
+        isRetryingIndexIssues = true
+        Task {
+            defer { isRetryingIndexIssues = false }
+            do {
+                try await engine.retryFailedExtractions()
+                await refreshIndexManagement()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func reveal(_ issue: IndexIssue) {
+        NSWorkspace.shared.activateFileViewerSelecting([issue.url])
     }
 
     private func applyIndexingPreferences(_ preferences: IndexingPreferences, rescanAfterward: Bool) {
@@ -263,6 +402,9 @@ final class AppModel: ObservableObject {
                 await previousIndexTask?.value
                 try await engine.updateIndexingPreferences(preferences)
                 await refreshIndexManagement()
+                if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    scheduleSearch()
+                }
                 if rescanAfterward {
                     let availableRoots = roots.filter { $0.isEnabled && $0.isAvailable }
                     beginIndexing(availableRoots, initialActivity: "Applying indexing preferences…")
@@ -276,7 +418,15 @@ final class AppModel: ObservableObject {
 
     func saveCurrentSearch() {
         guard let engine, !query.isEmpty else { return }
-        let saved = SavedSearch(name: query, request: SearchRequest(query: query, mode: mode, filters: filters))
+        let saved = SavedSearch(
+            name: query,
+            request: SearchRequest(
+                query: query,
+                mode: mode,
+                filters: filters,
+                hybridSemanticWeight: hybridSemanticWeight
+            )
+        )
         Task {
             do { try await engine.saveSearch(saved); savedSearches = try await engine.savedSearches() }
             catch { errorMessage = error.localizedDescription }
@@ -288,6 +438,28 @@ final class AppModel: ObservableObject {
         Task {
             do { try await engine.deleteSavedSearch(id: saved.id); savedSearches = try await engine.savedSearches() }
             catch { errorMessage = error.localizedDescription }
+        }
+    }
+
+    func setSavedSearchPinned(_ saved: SavedSearch, pinned: Bool) {
+        guard let engine else { return }
+        var updated = saved
+        updated.isPinned = pinned
+        if let index = savedSearches.firstIndex(where: { $0.id == saved.id }) {
+            savedSearches[index] = updated
+            savedSearches.sort {
+                if $0.isPinned != $1.isPinned { return $0.isPinned && !$1.isPinned }
+                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
+        }
+        Task {
+            do {
+                try await engine.saveSearch(updated)
+                savedSearches = try await engine.savedSearches()
+            } catch {
+                savedSearches = (try? await engine.savedSearches()) ?? savedSearches
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -308,7 +480,11 @@ final class AppModel: ObservableObject {
     func installSemanticModel() {
         guard let engine else { return }
         Task {
-            do { try await engine.installSemanticModel() }
+            do {
+                try await engine.installSemanticModel()
+                mode = .hybrid
+                scheduleSearch()
+            }
             catch { errorMessage = error.localizedDescription }
             semanticStatus = await engine.semanticStatus()
         }
@@ -337,13 +513,31 @@ final class AppModel: ObservableObject {
             do { try await engine.removeSemanticModel() }
             catch { errorMessage = error.localizedDescription }
             semanticStatus = await engine.semanticStatus()
-            if mode != .text { scheduleSearch() }
+            if mode != .text {
+                mode = .text
+                scheduleSearch()
+            }
         }
     }
 
     func open(_ hit: SearchHit) { NSWorkspace.shared.open(hit.url) }
 
     func quickLook(_ hit: SearchHit) { QuickLookController.shared.show(hit.url) }
+
+    func toggleQuickLook(_ hit: SearchHit) { QuickLookController.shared.toggle(hit.url) }
+
+    func moveQuickLookSelection(by offset: Int) -> Bool {
+        guard QuickLookController.shared.isVisible, !results.isEmpty else { return false }
+        let currentIndex = selectedHitPath.flatMap { path in
+            results.firstIndex { $0.path == path }
+        } ?? 0
+        let nextIndex = min(max(currentIndex + offset, 0), results.count - 1)
+        guard nextIndex != currentIndex else { return true }
+        let nextHit = results[nextIndex]
+        selectedHitPath = nextHit.path
+        QuickLookController.shared.updateIfVisible(nextHit.url)
+        return true
+    }
 
     func reveal(_ hit: SearchHit) {
         NSWorkspace.shared.activateFileViewerSelecting([hit.url])
@@ -368,11 +562,13 @@ final class AppModel: ObservableObject {
             async let savedValue = engine.savedSearches()
             async let healthValue = engine.health()
             async let preferencesValue = engine.indexingPreferences()
+            async let issuesValue = engine.indexIssues(limit: 100)
             roots = try await rootsValue
             history = try await historyValue
             savedSearches = try await savedValue
             health = try await healthValue
             indexingPreferences = try await preferencesValue
+            indexIssues = try await issuesValue
             progress = await engine.progress()
             semanticStatus = await engine.semanticStatus()
         } catch {

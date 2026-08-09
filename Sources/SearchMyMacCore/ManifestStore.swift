@@ -14,22 +14,99 @@ struct ExclusionPurgeBatch: Sendable {
     let isFinished: Bool
 }
 
+struct LexicalOperation: Sendable {
+    enum Kind: String, Sendable { case upsert, delete }
+    let sourceID: String
+    let generation: Int64
+    let kind: Kind
+}
+
+struct LexicalDocument: Sendable {
+    let input: TantivyDocumentInput
+}
+
 actor ManifestStore {
+    // Ranking v3: filename, title, and path matches remain useful recall signals,
+    // but a passage with no match in its body must not outrank actual content.
+    // Multi-term queries also reward meaningful-field coverage and proximity;
+    // path matches contribute recall but never coverage/proximity bonuses.
+    private static let metadataOnlyMatchMultiplier = 0.08
+    /// Structured tabular files are often large and repetitive, and are less
+    /// useful during early semantic coverage than prose documents.
+    private static let lowPrioritySemanticExtensions = [
+        "csv", "tsv",
+        "xls", "xlsx", "xlsm", "xlsb",
+        "xlt", "xltx", "xltm",
+        "ods", "numbers"
+    ]
+
     private let database: SQLiteDatabase
     private let parser = LexicalQueryParser()
     private let databaseURL: URL
     private var historyRecordingEnabled = true
 
-    init(databaseURL: URL) throws {
+    init(databaseURL: URL, readOnly: Bool = false) throws {
         self.databaseURL = databaseURL
-        let database = try SQLiteDatabase(url: databaseURL)
+        let database = try SQLiteDatabase(url: databaseURL, readOnly: readOnly)
         self.database = database
-        try Self.migrate(database)
+        historyRecordingEnabled = !readOnly
+        if !readOnly { try Self.migrate(database) }
+    }
+
+    func checkpointForShutdown() throws {
+        try database.checkpointForShutdown()
     }
 
     func generation() throws -> Int64 {
         let rows = try database.query("SELECT value FROM app_state WHERE key = 'generation'")
         return rows.first?["value"]?.int64 ?? 0
+    }
+
+    func semanticEmbeddingFormatVersion() throws -> Int {
+        let rows = try database.query("SELECT value FROM app_state WHERE key = 'semantic_embedding_format'")
+        return Int(rows.first?["value"]?.int64 ?? 0)
+    }
+
+    func setSemanticEmbeddingFormatVersion(_ version: Int) throws {
+        try database.execute(
+            "INSERT OR REPLACE INTO app_state(key, value) VALUES('semantic_embedding_format', ?)",
+            bindings: [.integer(Int64(version))]
+        )
+    }
+
+    func lexicalOperations(after generation: Int64) throws -> [LexicalOperation] {
+        try database.query(
+            "SELECT source_id, generation, operation FROM lexical_operations WHERE generation > ? ORDER BY generation, source_id",
+            bindings: [.integer(generation)]
+        ).compactMap { row in
+            guard let sourceID = row["source_id"]?.string,
+                  let generation = row["generation"]?.int64,
+                  let rawKind = row["operation"]?.string,
+                  let kind = LexicalOperation.Kind(rawValue: rawKind) else { return nil }
+            return LexicalOperation(sourceID: sourceID, generation: generation, kind: kind)
+        }
+    }
+
+    func clearLexicalOperations(through generation: Int64) throws {
+        try database.execute("DELETE FROM lexical_operations WHERE generation <= ?", bindings: [.integer(generation)])
+    }
+
+    func lexicalDocument(sourceID: String) throws -> LexicalDocument? {
+        try lexicalDocuments(whereClause: "WHERE f.source_id = ?", bindings: [.text(sourceID)]).first
+    }
+
+    func lexicalDocuments(afterSourceID: String?, limit: Int) throws -> [LexicalDocument] {
+        let safeLimit = max(1, limit)
+        if let afterSourceID {
+            return try lexicalDocuments(
+                whereClause: "WHERE f.source_id IN (SELECT source_id FROM files WHERE source_id > ? ORDER BY source_id LIMIT ?)",
+                bindings: [.text(afterSourceID), .integer(Int64(safeLimit))]
+            )
+        }
+        return try lexicalDocuments(
+            whereClause: "WHERE f.source_id IN (SELECT source_id FROM files ORDER BY source_id LIMIT ?)",
+            bindings: [.integer(Int64(safeLimit))]
+        )
     }
 
     func addRoot(_ root: IndexRoot) throws {
@@ -350,6 +427,10 @@ actor ManifestStore {
                     ]
                 )
             }
+            try database.execute(
+                "INSERT OR REPLACE INTO lexical_operations(source_id, generation, operation) VALUES(?, ?, 'upsert')",
+                bindings: [.text(file.sourceID), .integer(nextGeneration)]
+            )
             try setGeneration(nextGeneration)
         }
     }
@@ -408,7 +489,12 @@ actor ManifestStore {
             SELECT
                 p.id AS passage_id, p.source_id, p.body, p.location_kind, p.location_label,
                 f.path, f.filename, f.extension, f.modified_at, f.availability,
-                -bm25(passages_fts, 1.0, 5.0, 3.0, 0.7) AS rank_score,
+                passages_fts.title AS indexed_title,
+                -bm25(passages_fts, 1.0, 5.0, 3.0, 0.7) *
+                    CASE
+                        WHEN instr(highlight(passages_fts, 0, char(1), char(2)), char(1)) > 0 THEN 1.0
+                        ELSE \(Self.metadataOnlyMatchMultiplier)
+                    END AS rank_score,
                 snippet(passages_fts, 0, '', '', ' … ', 36) AS excerpt
             FROM passages_fts
             JOIN passages p ON p.id = passages_fts.rowid
@@ -424,6 +510,9 @@ actor ManifestStore {
             guard let sourceID = row["source_id"]?.string,
                   let path = row["path"]?.string,
                   let filename = row["filename"]?.string else { continue }
+            let body = row["body"]?.string ?? ""
+            let title = row["indexed_title"]?.string ?? ""
+            let baseScore = row["rank_score"]?.double ?? 0
             grouped[sourceID, default: []].append(
                 PassageMatch(
                     sourceID: sourceID,
@@ -434,9 +523,17 @@ actor ManifestStore {
                     availability: ContentAvailability(rawValue: row["availability"]?.string ?? "") ?? .filenameOnly,
                     passageID: String(row["passage_id"]?.int64 ?? 0),
                     excerpt: row["excerpt"]?.string ?? row["body"]?.string ?? "",
+                    body: body,
+                    title: title,
                     locationKind: StructuralLocationKind(rawValue: row["location_kind"]?.string ?? "") ?? .unknown,
                     locationLabel: row["location_label"]?.string,
-                    score: row["rank_score"]?.double ?? 0
+                    score: Self.lexicalPassageScore(
+                        baseScore: baseScore,
+                        body: body,
+                        title: title,
+                        filename: filename,
+                        queryTerms: terms
+                    )
                 )
             )
         }
@@ -445,10 +542,11 @@ actor ManifestStore {
             guard let first = matches.first else { return nil }
             let sorted = matches.sorted { $0.score > $1.score }
             let top = Array(sorted.prefix(3))
-            let aggregate = top.enumerated().reduce(0.0) { result, pair in
+            let passageAggregate = top.enumerated().reduce(0.0) { result, pair in
                 let weight = pair.offset == 0 ? 1.0 : (pair.offset == 1 ? 0.15 : 0.05)
                 return result + pair.element.score * weight
             }
+            let aggregate = passageAggregate * Self.documentCoverageMultiplier(matches, queryTerms: terms)
             let snippets = top.map { match in
                 SearchSnippet(
                     id: match.passageID,
@@ -489,6 +587,44 @@ actor ManifestStore {
         )
     }
 
+    func materializeTantivy(_ output: TantivySearchOutput, request: SearchRequest, offset: Int) throws -> SearchResponse {
+        let currentGeneration = try generation()
+        let terms = parser.highlightTerms(request.query)
+        var hits: [SearchHit] = []
+        for result in output.hits {
+            guard let file = try database.query(
+                "SELECT path, filename, extension, modified_at, availability FROM files WHERE source_id = ?",
+                bindings: [.text(result.sourceID)]
+            ).first else { continue }
+            var snippets: [SearchSnippet] = []
+            for passage in result.passages {
+                guard let row = try database.query(
+                    "SELECT body, location_kind, location_label FROM passages WHERE id = ? AND source_id = ?",
+                    bindings: [.integer(Int64(clamping: passage.passageID)), .text(result.sourceID)]
+                ).first else { continue }
+                let body = row["body"]?.string ?? passage.body
+                let excerpt = Self.lexicalExcerpt(body, terms: terms)
+                snippets.append(SearchSnippet(
+                    id: String(passage.passageID), text: excerpt,
+                    highlights: highlightRanges(in: excerpt, terms: terms),
+                    locationKind: StructuralLocationKind(rawValue: row["location_kind"]?.string ?? "") ?? .unknown,
+                    locationLabel: row["location_label"]?.string,
+                    score: Double(passage.score)
+                ))
+            }
+            guard let path = file["path"]?.string, let filename = file["filename"]?.string else { continue }
+            hits.append(SearchHit(
+                id: result.sourceID, url: URL(fileURLWithPath: path), filename: filename, path: path,
+                fileExtension: file["extension"]?.string ?? "",
+                modifiedAt: file["modified_at"]?.double.map(Date.init(timeIntervalSince1970:)),
+                availability: ContentAvailability(rawValue: file["availability"]?.string ?? "") ?? .filenameOnly,
+                score: Double(result.score), snippets: snippets
+            ))
+        }
+        let nextCursor = output.hits.count >= request.limit ? "\(currentGeneration):\(offset + output.hits.count)" : nil
+        return SearchResponse(requestID: request.id, generation: currentGeneration, hits: hits, nextCursor: nextCursor, effectiveMode: .text)
+    }
+
     func semanticCounts(modelID: String) throws -> (embedded: Int, total: Int) {
         let row = try database.query(
             """
@@ -502,16 +638,53 @@ actor ManifestStore {
     }
 
     func nextSemanticPassages(modelID: String, limit: Int) throws -> [SemanticPassageRecord] {
-        try database.query(
+        let lowPriorityExtensions = Self.lowPrioritySemanticExtensions
+        let rows = try database.query(
             """
-            SELECT p.id, p.body, f.filename
-            FROM passages p JOIN files f ON f.source_id = p.source_id
-            WHERE length(trim(p.body)) > 0 AND COALESCE(p.embedding_model, '') != ?
-            ORDER BY COALESCE(f.modified_at, 0) DESC, p.id
+            WITH embedded_counts AS (
+                SELECT source_id, COUNT(*) AS embedded_count
+                FROM passages
+                WHERE embedding_model = ?
+                GROUP BY source_id
+            ),
+            pending AS (
+                SELECT
+                    p.id,
+                    p.body,
+                    p.source_id,
+                    f.filename,
+                    f.modified_at,
+                    CASE
+                        WHEN lower(COALESCE(f.extension, '')) IN (\(placeholders(lowPriorityExtensions.count))) THEN 1
+                        ELSE 0
+                    END AS format_priority,
+                    COALESCE(embedded_counts.embedded_count, 0) AS source_embedded_count,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY p.source_id
+                        ORDER BY p.ordinal, p.id
+                    ) AS pending_rank
+                FROM passages p
+                JOIN files f ON f.source_id = p.source_id
+                LEFT JOIN embedded_counts ON embedded_counts.source_id = p.source_id
+                WHERE length(trim(p.body)) > 0
+                  AND COALESCE(p.embedding_model, '') != ?
+            )
+            SELECT id, body, filename
+            FROM pending
+            WHERE pending_rank = 1
+            ORDER BY
+                format_priority,
+                source_embedded_count,
+                COALESCE(modified_at, 0) DESC,
+                id
             LIMIT ?
             """,
-            bindings: [.text(modelID), .integer(Int64(max(1, limit)))]
-        ).compactMap { row in
+            bindings:
+                [.text(modelID)] +
+                lowPriorityExtensions.map { .text($0) } +
+                [.text(modelID), .integer(Int64(max(1, limit)))]
+        )
+        return rows.compactMap { row -> SemanticPassageRecord? in
             guard let id = row["id"]?.int64, id >= 0, let text = row["body"]?.string else { return nil }
             return SemanticPassageRecord(id: UInt64(id), text: text, filename: row["filename"]?.string ?? "")
         }
@@ -560,6 +733,14 @@ actor ManifestStore {
         let scores = Dictionary(uniqueKeysWithValues: matches.map { (Int64(clamping: $0.key), Double($0.score)) })
         var conditions = ["p.id IN (\(placeholders(matches.count)))"]
         var bindings: [SQLiteValue] = matches.map { .integer(Int64(clamping: $0.key)) }
+        // OCR remains searchable in Text mode, but screenshots and photos often
+        // contain UI chrome or recognition noise that can dominate a partial
+        // semantic corpus. Include image passages only for an explicit image
+        // type search.
+        if !Self.shouldIncludeImageSemanticResults(for: request.filters) {
+            conditions.append("p.location_kind != ?")
+            bindings.append(.text(StructuralLocationKind.image.rawValue))
+        }
         appendSearchFilters(request.filters, conditions: &conditions, bindings: &bindings)
         let rows = try database.query(
             """
@@ -583,6 +764,7 @@ actor ManifestStore {
                 modifiedAt: row["modified_at"]?.double.map(Date.init(timeIntervalSince1970:)),
                 availability: ContentAvailability(rawValue: row["availability"]?.string ?? "") ?? .filenameOnly,
                 passageID: String(passageID), excerpt: Self.semanticExcerpt(body),
+                body: body, title: filename,
                 locationKind: StructuralLocationKind(rawValue: row["location_kind"]?.string ?? "") ?? .unknown,
                 locationLabel: row["location_label"]?.string,
                 score: scores[passageID] ?? 0
@@ -605,6 +787,11 @@ actor ManifestStore {
             )
         }.sorted { $0.score > $1.score }.prefix(request.limit)
         return SearchResponse(requestID: request.id, generation: currentGeneration, hits: Array(hits), effectiveMode: .semantic)
+    }
+
+    private static func shouldIncludeImageSemanticResults(for filters: SearchFilters) -> Bool {
+        let requestedExtensions = Set(filters.extensions.map { $0.lowercased() })
+        return !requestedExtensions.isDisjoint(with: DocumentExtractor.imageExtensions)
     }
 
     private func appendSearchFilters(_ filters: SearchFilters, conditions: inout [String], bindings: inout [SQLiteValue]) {
@@ -654,16 +841,59 @@ actor ManifestStore {
                 (SELECT COALESCE(SUM(discovery_error_count), 0) FROM root_events) AS discovery_error_count
             """
         ).first ?? [:]
-        let bytes = storageBytes(in: databaseURL.deletingLastPathComponent())
+        let storageDirectory = databaseURL.deletingLastPathComponent()
+        let totalBytes = storageBytes(in: storageDirectory)
+        let lexicalFilesBytes = storageBytesForFiles(
+            in: storageDirectory,
+            whoseNameHasPrefix: databaseURL.lastPathComponent
+        )
+        let modelBytes = storageBytes(in: storageDirectory.appendingPathComponent("Models", isDirectory: true))
+        let semanticBytes = storageBytes(in: storageDirectory.appendingPathComponent("Semantic", isDirectory: true))
+        let tantivyBytes = storageBytes(in: storageDirectory.appendingPathComponent("Tantivy-v3", isDirectory: true))
+        // Staging rows and their indexes average roughly 420 allocated bytes in
+        // the million-file benchmark. Avoid the expensive dbstat virtual table
+        // here because health is polled while indexing is active.
+        let stagedCount = try database.query(
+            "SELECT COUNT(*) AS count FROM scan_items"
+        ).first?["count"]?.int64 ?? 0
+        let workingBytes = stagedCount * 420
+        let lexicalBytes = max(0, lexicalFilesBytes - workingBytes) + tantivyBytes
         return IndexHealth(
             fileCount: Int(row["file_count"]?.int64 ?? 0),
             passageCount: Int(row["passage_count"]?.int64 ?? 0),
             failedCount: Int(row["failed_count"]?.int64 ?? 0),
             filenameOnlyCount: Int(row["filename_only_count"]?.int64 ?? 0),
             inaccessibleLocationCount: Int(row["discovery_error_count"]?.int64 ?? 0),
-            databaseBytes: bytes,
+            databaseBytes: totalBytes,
+            lexicalIndexBytes: lexicalBytes,
+            semanticModelBytes: modelBytes,
+            semanticIndexBytes: semanticBytes,
+            workingStorageBytes: workingBytes,
             generation: try generation()
         )
+    }
+
+    func indexIssues(limit: Int) throws -> [IndexIssue] {
+        try database.query(
+            """
+            SELECT source_id, root_id, path, error
+            FROM files
+            WHERE availability = 'extractionFailed'
+            ORDER BY filename COLLATE NOCASE, path COLLATE NOCASE
+            LIMIT ?
+            """,
+            bindings: [.integer(Int64(max(0, limit)))]
+        ).compactMap { row in
+            guard let sourceID = row["source_id"]?.string,
+                  let rootID = row["root_id"]?.string,
+                  let path = row["path"]?.string else { return nil }
+            return IndexIssue(
+                sourceID: sourceID,
+                rootID: rootID,
+                url: URL(fileURLWithPath: path),
+                message: row["error"]?.string ?? "Text extraction failed"
+            )
+        }
     }
 
     func indexingPreferences() throws -> IndexingPreferences {
@@ -749,6 +979,7 @@ actor ManifestStore {
     }
 
     func compact() throws {
+        try database.execute("INSERT INTO passages_fts(passages_fts) VALUES('optimize')")
         _ = try database.query("PRAGMA wal_checkpoint(TRUNCATE)")
         try database.execute("VACUUM")
     }
@@ -776,7 +1007,9 @@ actor ManifestStore {
     func savedSearches() throws -> [SavedSearch] {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try database.query("SELECT id, name, request, created_at FROM saved_searches ORDER BY name COLLATE NOCASE").compactMap { row in
+        return try database.query(
+            "SELECT id, name, request, created_at, is_pinned FROM saved_searches ORDER BY is_pinned DESC, name COLLATE NOCASE"
+        ).compactMap { row in
             guard let id = row["id"]?.string,
                   let name = row["name"]?.string,
                   let data = row["request"],
@@ -784,7 +1017,13 @@ actor ManifestStore {
             let requestData: Data
             switch data { case .blob(let value): requestData = value; default: return nil }
             guard let request = try? decoder.decode(SearchRequest.self, from: requestData) else { return nil }
-            return SavedSearch(id: id, name: name, request: request, createdAt: Date(timeIntervalSince1970: created))
+            return SavedSearch(
+                id: id,
+                name: name,
+                request: request,
+                createdAt: Date(timeIntervalSince1970: created),
+                isPinned: row["is_pinned"]?.int64 == 1
+            )
         }
     }
 
@@ -792,8 +1031,11 @@ actor ManifestStore {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         try database.execute(
-            "INSERT OR REPLACE INTO saved_searches(id, name, request, created_at) VALUES(?, ?, ?, ?)",
-            bindings: [.text(saved.id), .text(saved.name), .blob(try encoder.encode(saved.request)), .real(saved.createdAt.timeIntervalSince1970)]
+            "INSERT OR REPLACE INTO saved_searches(id, name, request, created_at, is_pinned) VALUES(?, ?, ?, ?, ?)",
+            bindings: [
+                .text(saved.id), .text(saved.name), .blob(try encoder.encode(saved.request)),
+                .real(saved.createdAt.timeIntervalSince1970), .integer(saved.isPinned ? 1 : 0)
+            ]
         )
     }
 
@@ -811,6 +1053,7 @@ actor ManifestStore {
             """
         )
         try database.execute("INSERT OR IGNORE INTO app_state(key, value) VALUES('generation', 0)")
+        try database.execute("INSERT OR IGNORE INTO app_state(key, value) VALUES('semantic_embedding_format', 0)")
         try database.execute(
             """
             CREATE TABLE IF NOT EXISTS roots(
@@ -899,8 +1142,21 @@ actor ManifestStore {
         try database.execute("CREATE INDEX IF NOT EXISTS passages_source_idx ON passages(source_id)")
         try database.execute("CREATE INDEX IF NOT EXISTS passages_embedding_idx ON passages(embedding_model)")
         try database.execute(
+            "CREATE INDEX IF NOT EXISTS passages_embedding_source_idx ON passages(embedding_model, source_id)"
+        )
+        try database.execute(
             "CREATE TABLE IF NOT EXISTS semantic_tombstones(passage_id INTEGER PRIMARY KEY)"
         )
+        try database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lexical_operations(
+                source_id TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL,
+                operation TEXT NOT NULL CHECK(operation IN ('upsert', 'delete'))
+            )
+            """
+        )
+        try database.execute("CREATE INDEX IF NOT EXISTS lexical_operations_generation_idx ON lexical_operations(generation)")
         try database.execute(
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS passages_fts USING fts5(
@@ -950,11 +1206,68 @@ actor ManifestStore {
             )
             """
         )
+        try? database.execute("ALTER TABLE saved_searches ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0")
     }
 
     private func deleteFile(sourceID: String) throws {
+        let nextGeneration = try generation() + 1
         try deletePassages(sourceID: sourceID)
         try database.execute("DELETE FROM files WHERE source_id = ?", bindings: [.text(sourceID)])
+        try database.execute(
+            "INSERT OR REPLACE INTO lexical_operations(source_id, generation, operation) VALUES(?, ?, 'delete')",
+            bindings: [.text(sourceID), .integer(nextGeneration)]
+        )
+    }
+
+    private func lexicalDocuments(whereClause: String, bindings: [SQLiteValue]) throws -> [LexicalDocument] {
+        let rows = try database.query(
+            """
+            SELECT f.source_id, f.root_id, f.path, f.filename, f.extension, f.modified_at,
+                   f.availability, f.desired_generation, p.id AS passage_id, p.body, p.ordinal,
+                   COALESCE((SELECT title FROM passages_fts WHERE rowid = p.id), '') AS title
+            FROM files f LEFT JOIN passages p ON p.source_id = f.source_id
+            \(whereClause)
+            ORDER BY f.source_id, p.ordinal
+            """,
+            bindings: bindings
+        )
+        var grouped: [String: (metadata: [String: SQLiteValue], passages: [TantivyPassageInput], title: String)] = [:]
+        var order: [String] = []
+        for row in rows {
+            guard let sourceID = row["source_id"]?.string else { continue }
+            if grouped[sourceID] == nil {
+                order.append(sourceID)
+                grouped[sourceID] = (row, [], row["title"]?.string ?? "")
+            }
+            if let passageID = row["passage_id"]?.int64, passageID >= 0 {
+                grouped[sourceID]?.passages.append(TantivyPassageInput(passageID: UInt64(passageID), body: row["body"]?.string ?? ""))
+            }
+        }
+        return order.compactMap { sourceID in
+            guard let value = grouped[sourceID], let path = value.metadata["path"]?.string else { return nil }
+            return LexicalDocument(input: TantivyDocumentInput(
+                sourceID: sourceID,
+                generation: value.metadata["desired_generation"]?.int64 ?? 0,
+                filename: value.metadata["filename"]?.string ?? URL(fileURLWithPath: path).lastPathComponent,
+                title: value.title, path: path,
+                modifiedAt: Int64(value.metadata["modified_at"]?.double ?? 0),
+                availability: value.metadata["availability"]?.string ?? ContentAvailability.filenameOnly.rawValue,
+                rootID: value.metadata["root_id"]?.string ?? "",
+                extension: value.metadata["extension"]?.string ?? "",
+                passages: value.passages
+            ))
+        }
+    }
+
+    private static func lexicalExcerpt(_ body: String, terms: [String]) -> String {
+        guard body.count > 500 else { return body }
+        let folded = body.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        let location = terms.compactMap { folded.range(of: $0)?.lowerBound }.min() ?? folded.startIndex
+        let distance = folded.distance(from: folded.startIndex, to: location)
+        let startOffset = max(0, distance - 100)
+        let start = body.index(body.startIndex, offsetBy: min(startOffset, body.count))
+        let end = body.index(start, offsetBy: min(500, body.distance(from: start, to: body.endIndex)))
+        return (start == body.startIndex ? "" : "… ") + String(body[start..<end]) + (end == body.endIndex ? "" : " …")
     }
 
     private func deletePassages(sourceID: String) throws {
@@ -1057,6 +1370,111 @@ actor ManifestStore {
         return ranges.sorted { $0.location < $1.location }.map { HighlightRange(location: $0.location, length: $0.length) }
     }
 
+    private static func lexicalPassageScore(
+        baseScore: Double,
+        body: String,
+        title: String,
+        filename: String,
+        queryTerms: [String]
+    ) -> Double {
+        let normalizedTerms = rankingTerms(queryTerms)
+        guard normalizedTerms.count > 1 else { return baseScore }
+
+        let bodySignal = rankingSignal(in: body, terms: normalizedTerms)
+        let headingSignal = rankingSignal(in: "\(title) \(filename)", terms: normalizedTerms)
+        let fullCoverage = Double(normalizedTerms.count)
+        let meaningfulCoverage = Double(bodySignal.matched.union(headingSignal.matched).count) / fullCoverage
+
+        var multiplier = 1.0
+        if bodySignal.coverage == 1 {
+            multiplier += 4.0 + 3.0 * bodySignal.proximity
+        } else {
+            multiplier += 0.35 * bodySignal.coverage
+        }
+        if headingSignal.coverage == 1 {
+            multiplier += 5.0 + 3.0 * headingSignal.proximity
+        } else {
+            multiplier += headingSignal.coverage
+        }
+        if meaningfulCoverage == 1, bodySignal.coverage < 1, headingSignal.coverage < 1 {
+            multiplier += 2.5
+        }
+        return baseScore * multiplier
+    }
+
+    private static func documentCoverageMultiplier(
+        _ matches: [PassageMatch],
+        queryTerms: [String]
+    ) -> Double {
+        let normalizedTerms = rankingTerms(queryTerms)
+        guard normalizedTerms.count > 1 else { return 1 }
+        var matched: Set<Int> = []
+        for match in matches {
+            matched.formUnion(rankingSignal(in: match.body, terms: normalizedTerms).matched)
+            matched.formUnion(rankingSignal(in: "\(match.title) \(match.filename)", terms: normalizedTerms).matched)
+        }
+        let coverage = Double(matched.count) / Double(normalizedTerms.count)
+        return coverage == 1 ? 1.8 : 1.0 + 0.25 * coverage
+    }
+
+    private static func rankingTerms(_ terms: [String]) -> [[String]] {
+        var seen: Set<String> = []
+        return terms.compactMap { term in
+            let tokens = rankingTokens(in: term)
+            guard !tokens.isEmpty else { return nil }
+            let key = tokens.joined(separator: " ")
+            guard seen.insert(key).inserted else { return nil }
+            return tokens
+        }
+    }
+
+    private static func rankingSignal(in text: String, terms: [[String]]) -> RankingSignal {
+        guard !terms.isEmpty else { return RankingSignal(matched: [], totalTerms: 0, proximity: 0) }
+        let tokens = rankingTokens(in: text)
+        guard !tokens.isEmpty else { return RankingSignal(matched: [], totalTerms: terms.count, proximity: 0) }
+
+        var events: [(position: Int, term: Int)] = []
+        var matched: Set<Int> = []
+        for (termIndex, phrase) in terms.enumerated() where phrase.count <= tokens.count {
+            for start in 0...(tokens.count - phrase.count) {
+                if tokens[start..<(start + phrase.count)].elementsEqual(phrase) {
+                    matched.insert(termIndex)
+                    events.append((start, termIndex))
+                }
+            }
+        }
+        guard matched.count == terms.count else {
+            return RankingSignal(matched: matched, totalTerms: terms.count, proximity: 0)
+        }
+
+        events.sort { $0.position < $1.position }
+        var counts = Array(repeating: 0, count: terms.count)
+        var covered = 0
+        var left = 0
+        var minimumSpan = Int.max
+        for right in events.indices {
+            let rightTerm = events[right].term
+            if counts[rightTerm] == 0 { covered += 1 }
+            counts[rightTerm] += 1
+            while covered == terms.count, left <= right {
+                minimumSpan = min(minimumSpan, events[right].position - events[left].position)
+                let leftTerm = events[left].term
+                counts[leftTerm] -= 1
+                if counts[leftTerm] == 0 { covered -= 1 }
+                left += 1
+            }
+        }
+        let proximity = minimumSpan == Int.max ? 0 : 1.0 / (1.0 + Double(minimumSpan) / 8.0)
+        return RankingSignal(matched: matched, totalTerms: terms.count, proximity: proximity)
+    }
+
+    private static func rankingTokens(in text: String) -> [String] {
+        text.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: .current)
+            .lowercased()
+            .split { !$0.isLetter && !$0.isNumber }
+            .map(String.init)
+    }
+
     private static func discoveredFile(from row: [String: SQLiteValue]) -> DiscoveredFile? {
         guard let sourceID = row["source_id"]?.string,
               let rootID = row["root_id"]?.string,
@@ -1085,6 +1503,20 @@ actor ManifestStore {
         }
         return total
     }
+
+    private func storageBytesForFiles(in directory: URL, whoseNameHasPrefix prefix: String) -> Int64 {
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else { return 0 }
+        return urls.filter { $0.lastPathComponent.hasPrefix(prefix) }.reduce(into: 0) { total, url in
+            let values = try? url.resourceValues(forKeys: [
+                .totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .fileSizeKey
+            ])
+            total += Int64(values?.totalFileAllocatedSize ?? values?.fileAllocatedSize ?? values?.fileSize ?? 0)
+        }
+    }
 }
 
 private struct PassageMatch {
@@ -1096,7 +1528,20 @@ private struct PassageMatch {
     var availability: ContentAvailability
     var passageID: String
     var excerpt: String
+    var body: String
+    var title: String
     var locationKind: StructuralLocationKind
     var locationLabel: String?
     var score: Double
+}
+
+private struct RankingSignal {
+    var matched: Set<Int>
+    var totalTerms: Int
+    var proximity: Double
+
+    var coverage: Double {
+        guard totalTerms > 0 else { return 0 }
+        return Double(matched.count) / Double(totalTerms)
+    }
 }

@@ -39,7 +39,7 @@ public struct DiscoverySummary: Sendable, Equatable {
 public struct DiscoveryPolicy: Sendable {
     /// Increment whenever an exclusion changes so existing indexes are cleaned
     /// immediately instead of retaining old-policy records until a full scan ends.
-    public static let version = 1
+    public static let version = 3
 
     public var excludedDirectoryNames: Set<String>
     public var excludedPathComponents: Set<String>
@@ -72,7 +72,7 @@ public struct DiscoveryPolicy: Sendable {
         managedHomeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         allowedHomeLibraryDirectories: Set<String> = ["CloudStorage", "Mobile Documents"],
         contentExtensions: Set<String> = DocumentExtractor.supportedExtensions,
-        excludeSourceCode: Bool = false,
+        excludeSourceCode: Bool = true,
         sourceCodeExtensions: Set<String> = [
             "swift", "m", "mm", "h", "hpp", "c", "cc", "cpp", "rs", "go",
             "py", "rb", "js", "jsx", "ts", "tsx", "java", "kt", "kts",

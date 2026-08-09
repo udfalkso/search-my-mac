@@ -30,7 +30,7 @@ public struct SemanticStatus: Codable, Equatable, Sendable {
     public init(
         phase: SemanticPhase = .notInstalled,
         modelID: String = "qwen3-embedding-0.6b-q8",
-        modelDisplayName: String = "Qwen3 Embedding 0.6B (Q8)",
+        modelDisplayName: String = "Qwen3 Embedding 0.6B",
         modelBytes: Int64 = 639_150_592,
         downloadFraction: Double? = nil,
         embeddedPassages: Int = 0,
@@ -65,12 +65,28 @@ public enum ContentAvailability: String, Codable, Sendable {
     case semanticPending
 }
 
+public struct IndexIssue: Codable, Equatable, Identifiable, Sendable {
+    public var id: String { sourceID }
+    public let sourceID: String
+    public let rootID: String
+    public let url: URL
+    public let message: String
+
+    public init(sourceID: String, rootID: String, url: URL, message: String) {
+        self.sourceID = sourceID
+        self.rootID = rootID
+        self.url = url
+        self.message = message
+    }
+}
+
 public enum StructuralLocationKind: String, Codable, Sendable {
     case page
     case slide
     case sheet
     case section
     case line
+    case image
     case unknown
 }
 
@@ -119,10 +135,15 @@ public struct SearchFilters: Codable, Equatable, Sendable {
 }
 
 public struct SearchRequest: Codable, Equatable, Sendable {
+    public static let defaultHybridSemanticWeight = 0.35
+
     public var id: UUID
     public var query: String
     public var mode: SearchMode
     public var filters: SearchFilters
+    /// The semantic share of hybrid reciprocal-rank fusion. The lexical share
+    /// is its complement.
+    public var hybridSemanticWeight: Double
     public var limit: Int
     public var cursor: String?
 
@@ -131,6 +152,7 @@ public struct SearchRequest: Codable, Equatable, Sendable {
         query: String,
         mode: SearchMode = .text,
         filters: SearchFilters = .init(),
+        hybridSemanticWeight: Double = Self.defaultHybridSemanticWeight,
         limit: Int = 50,
         cursor: String? = nil
     ) {
@@ -138,8 +160,38 @@ public struct SearchRequest: Codable, Equatable, Sendable {
         self.query = query
         self.mode = mode
         self.filters = filters
+        self.hybridSemanticWeight = min(max(hybridSemanticWeight, 0), 1)
         self.limit = min(max(limit, 1), 200)
         self.cursor = cursor
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, query, mode, filters, hybridSemanticWeight, limit, cursor
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            id: try values.decodeIfPresent(UUID.self, forKey: .id) ?? UUID(),
+            query: try values.decode(String.self, forKey: .query),
+            mode: try values.decodeIfPresent(SearchMode.self, forKey: .mode) ?? .text,
+            filters: try values.decodeIfPresent(SearchFilters.self, forKey: .filters) ?? .init(),
+            hybridSemanticWeight: try values.decodeIfPresent(Double.self, forKey: .hybridSemanticWeight)
+                ?? Self.defaultHybridSemanticWeight,
+            limit: try values.decodeIfPresent(Int.self, forKey: .limit) ?? 50,
+            cursor: try values.decodeIfPresent(String.self, forKey: .cursor)
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id)
+        try values.encode(query, forKey: .query)
+        try values.encode(mode, forKey: .mode)
+        try values.encode(filters, forKey: .filters)
+        try values.encode(hybridSemanticWeight, forKey: .hybridSemanticWeight)
+        try values.encode(limit, forKey: .limit)
+        try values.encodeIfPresent(cursor, forKey: .cursor)
     }
 }
 
@@ -325,12 +377,20 @@ public struct SavedSearch: Identifiable, Codable, Equatable, Sendable {
     public var name: String
     public var request: SearchRequest
     public var createdAt: Date
+    public var isPinned: Bool
 
-    public init(id: String = UUID().uuidString, name: String, request: SearchRequest, createdAt: Date = .now) {
+    public init(
+        id: String = UUID().uuidString,
+        name: String,
+        request: SearchRequest,
+        createdAt: Date = .now,
+        isPinned: Bool = false
+    ) {
         self.id = id
         self.name = name
         self.request = request
         self.createdAt = createdAt
+        self.isPinned = isPinned
     }
 }
 
@@ -341,7 +401,19 @@ public struct IndexHealth: Codable, Equatable, Sendable {
     public var filenameOnlyCount: Int
     public var inaccessibleLocationCount: Int
     public var databaseBytes: Int64
+    public var lexicalIndexBytes: Int64
+    public var semanticModelBytes: Int64
+    public var semanticIndexBytes: Int64
+    public var workingStorageBytes: Int64
     public var generation: Int64
+
+    public var semanticStorageBytes: Int64 {
+        max(0, semanticModelBytes + semanticIndexBytes)
+    }
+
+    public var nonSemanticStorageBytes: Int64 {
+        max(0, databaseBytes - semanticStorageBytes)
+    }
 
     public init(
         fileCount: Int = 0,
@@ -350,6 +422,10 @@ public struct IndexHealth: Codable, Equatable, Sendable {
         filenameOnlyCount: Int = 0,
         inaccessibleLocationCount: Int = 0,
         databaseBytes: Int64 = 0,
+        lexicalIndexBytes: Int64 = 0,
+        semanticModelBytes: Int64 = 0,
+        semanticIndexBytes: Int64 = 0,
+        workingStorageBytes: Int64 = 0,
         generation: Int64 = 0
     ) {
         self.fileCount = fileCount
@@ -358,6 +434,10 @@ public struct IndexHealth: Codable, Equatable, Sendable {
         self.filenameOnlyCount = filenameOnlyCount
         self.inaccessibleLocationCount = inaccessibleLocationCount
         self.databaseBytes = databaseBytes
+        self.lexicalIndexBytes = lexicalIndexBytes
+        self.semanticModelBytes = semanticModelBytes
+        self.semanticIndexBytes = semanticIndexBytes
+        self.workingStorageBytes = workingStorageBytes
         self.generation = generation
     }
 }
@@ -366,7 +446,7 @@ public struct IndexingPreferences: Codable, Equatable, Sendable {
     public var excludeSourceCode: Bool
     public var excludedFolderPaths: Set<String>
 
-    public init(excludeSourceCode: Bool = false, excludedFolderPaths: Set<String> = []) {
+    public init(excludeSourceCode: Bool = true, excludedFolderPaths: Set<String> = []) {
         self.excludeSourceCode = excludeSourceCode
         self.excludedFolderPaths = excludedFolderPaths
     }

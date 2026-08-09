@@ -4,27 +4,33 @@ import Foundation
 final class SQLiteDatabase: @unchecked Sendable {
     private var handle: OpaquePointer?
     private let lock = NSRecursiveLock()
+    private let isReadOnly: Bool
     let url: URL
 
-    init(url: URL) throws {
+    init(url: URL, readOnly: Bool = false) throws {
         self.url = url
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
+        self.isReadOnly = readOnly
+        if !readOnly {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
 
         var database: OpaquePointer?
-        let flags = SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
+        let flags = (readOnly ? SQLITE_OPEN_READONLY : SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE) | SQLITE_OPEN_FULLMUTEX
         guard sqlite3_open_v2(url.path, &database, flags, nil) == SQLITE_OK, let database else {
             let message = database.map { String(cString: sqlite3_errmsg($0)) } ?? "Unable to open SQLite database"
             if let database { sqlite3_close(database) }
             throw SearchMyMacError.database(message)
         }
         handle = database
-        _ = try query("PRAGMA journal_mode=WAL")
-        _ = try query("PRAGMA synchronous=NORMAL")
-        _ = try query("PRAGMA foreign_keys=ON")
+        if !readOnly {
+            _ = try query("PRAGMA journal_mode=WAL")
+            _ = try query("PRAGMA synchronous=NORMAL")
+            _ = try query("PRAGMA foreign_keys=ON")
+        }
         _ = try query("PRAGMA busy_timeout=5000")
     }
 
@@ -32,7 +38,13 @@ final class SQLiteDatabase: @unchecked Sendable {
         if let handle { sqlite3_close(handle) }
     }
 
+    func checkpointForShutdown() throws {
+        guard !isReadOnly else { return }
+        _ = try query("PRAGMA wal_checkpoint(PASSIVE)")
+    }
+
     func execute(_ sql: String, bindings: [SQLiteValue] = []) throws {
+        guard !isReadOnly else { throw SearchMyMacError.database("The search index was opened read-only.") }
         try lock.withLock {
             let statement = try prepare(sql)
             defer { sqlite3_finalize(statement) }
