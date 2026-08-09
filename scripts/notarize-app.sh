@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Builds a Developer-ID-signed, notarized ZIP without touching the normal
+# development app bundle. Credentials stay in the local Keychain profile.
+
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUTPUT_ROOT="${SMM_DISTRIBUTION_OUTPUT_DIR:-$PROJECT_ROOT/.build/distribution}"
+APP_PATH="$OUTPUT_ROOT/Search My Mac.app"
+NOTARY_PROFILE="${SMM_NOTARY_PROFILE:-Search My Mac Notarization}"
+
+if [[ -n "${SMM_DISTRIBUTION_SIGNING_IDENTITY:-}" ]]; then
+  SIGNING_IDENTITY="$SMM_DISTRIBUTION_SIGNING_IDENTITY"
+else
+  mapfile -t DEVELOPER_ID_IDENTITIES < <(
+    security find-identity -v -p codesigning \
+      | awk '/Developer ID Application/ { print $2 }'
+  )
+  case "${#DEVELOPER_ID_IDENTITIES[@]}" in
+    1) SIGNING_IDENTITY="${DEVELOPER_ID_IDENTITIES[0]}" ;;
+    0)
+      echo "No Developer ID Application certificate is installed." >&2
+      echo "Create one in Xcode or the Apple Developer portal, then rerun this script." >&2
+      exit 1
+      ;;
+    *)
+      echo "More than one Developer ID Application certificate is installed." >&2
+      echo "Set SMM_DISTRIBUTION_SIGNING_IDENTITY to the certificate SHA-1 fingerprint to choose one." >&2
+      exit 1
+      ;;
+  esac
+fi
+
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PROJECT_ROOT/Resources/App/Info.plist")"
+ARCHIVE_PATH="$OUTPUT_ROOT/Search My Mac-${VERSION}.zip"
+NOTARY_ARCHIVE_PATH="$OUTPUT_ROOT/Search My Mac-notarization.zip"
+
+mkdir -p "$OUTPUT_ROOT"
+rm -f "$ARCHIVE_PATH" "$NOTARY_ARCHIVE_PATH"
+
+echo "Building Search My Mac ${VERSION} with Developer ID signing…"
+env \
+  SMM_APP_ROOT="$APP_PATH" \
+  SMM_CONFIGURATION=release \
+  SMM_DISTRIBUTION_SIGNING=1 \
+  SMM_CODESIGN_IDENTITY="$SIGNING_IDENTITY" \
+  "$PROJECT_ROOT/scripts/build-app.sh"
+
+echo "Verifying signature…"
+codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+SIGNATURE_INFO="$(codesign -dvv "$APP_PATH" 2>&1)"
+if ! grep -Eq 'Authority=Developer ID Application:' <<<"$SIGNATURE_INFO"; then
+  echo "The distribution app is not signed with a Developer ID Application certificate." >&2
+  exit 1
+fi
+
+echo "Creating notarization archive…"
+ditto -c -k --keepParent "$APP_PATH" "$NOTARY_ARCHIVE_PATH"
+
+echo "Submitting to Apple for notarization…"
+xcrun notarytool submit "$NOTARY_ARCHIVE_PATH" \
+  --keychain-profile "$NOTARY_PROFILE" \
+  --wait
+
+echo "Stapling notarization ticket…"
+xcrun stapler staple "$APP_PATH"
+xcrun stapler validate "$APP_PATH"
+spctl --assess --type execute --verbose=4 "$APP_PATH"
+
+echo "Creating shareable archive…"
+ditto -c -k --keepParent "$APP_PATH" "$ARCHIVE_PATH"
+rm -f "$NOTARY_ARCHIVE_PATH"
+
+echo "Notarized archive ready: $ARCHIVE_PATH"

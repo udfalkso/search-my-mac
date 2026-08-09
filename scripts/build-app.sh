@@ -41,6 +41,7 @@ if [[ "$SIGNING_IDENTITY" == "-" ]]; then
 fi
 BUILD_CONFIGURATION="${SMM_CONFIGURATION:-debug}"
 PRIVATE_ENTITLEMENTS="${SMM_PRIVATE_ENTITLEMENTS:-0}"
+DISTRIBUTION_SIGNING="${SMM_DISTRIBUTION_SIGNING:-0}"
 if [[ -x /opt/homebrew/opt/rust/bin/cargo ]]; then
   CARGO_BIN=/opt/homebrew/opt/rust/bin/cargo
   RUSTC_BIN=/opt/homebrew/opt/rust/bin/rustc
@@ -122,15 +123,31 @@ if [[ "$SIGNING_IDENTITY" != "-" ]]; then
     exit 1
   fi
 fi
+if [[ "$DISTRIBUTION_SIGNING" == "1" ]]; then
+  if [[ "$SIGNING_IDENTITY" == "-" ]]; then
+    echo "Distribution signing requires a Developer ID Application identity." >&2
+    exit 1
+  fi
+  SIGNING_IDENTITY_DESCRIPTION="$(security find-identity -v -p codesigning | grep -F "$SIGNING_IDENTITY" || true)"
+  if ! grep -Fq 'Developer ID Application' <<<"$SIGNING_IDENTITY_DESCRIPTION"; then
+    echo "SMM_DISTRIBUTION_SIGNING requires a Developer ID Application identity." >&2
+    exit 1
+  fi
+fi
 /usr/libexec/PlistBuddy -c "Set :SMMAuthorizedClientRequirement $CLIENT_REQUIREMENT" "$XPC_ROOT/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :SMMEngineSigningRequirement $ENGINE_REQUIREMENT" "$APP_ROOT/Contents/Info.plist"
 
-codesign --force --sign "$SIGNING_IDENTITY" "$APP_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
-codesign --force --sign "$SIGNING_IDENTITY" "$XPC_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
-codesign --force --sign "$SIGNING_IDENTITY" "$APP_ROOT/Contents/Frameworks/llama.framework"
-codesign --force --sign "$SIGNING_IDENTITY" "$XPC_ROOT/Contents/Frameworks/llama.framework"
-codesign --force --sign "$SIGNING_IDENTITY" --identifier "com.searchmymac.cli" "$APP_ROOT/Contents/Helpers/smm"
-codesign --force --sign "$SIGNING_IDENTITY" --entitlements "$ENGINE_ENTITLEMENTS" "$XPC_ROOT"
-codesign --force --sign "$SIGNING_IDENTITY" --entitlements "$APP_ENTITLEMENTS" "$APP_ROOT"
+CODESIGN_ARGUMENTS=(--force --sign "$SIGNING_IDENTITY")
+if [[ "$DISTRIBUTION_SIGNING" == "1" ]]; then
+  CODESIGN_ARGUMENTS+=(--options runtime --timestamp)
+fi
+
+codesign "${CODESIGN_ARGUMENTS[@]}" "$APP_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
+codesign "${CODESIGN_ARGUMENTS[@]}" "$XPC_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
+codesign "${CODESIGN_ARGUMENTS[@]}" "$APP_ROOT/Contents/Frameworks/llama.framework"
+codesign "${CODESIGN_ARGUMENTS[@]}" "$XPC_ROOT/Contents/Frameworks/llama.framework"
+codesign "${CODESIGN_ARGUMENTS[@]}" --identifier "com.searchmymac.cli" "$APP_ROOT/Contents/Helpers/smm"
+codesign "${CODESIGN_ARGUMENTS[@]}" --entitlements "$ENGINE_ENTITLEMENTS" "$XPC_ROOT"
+codesign "${CODESIGN_ARGUMENTS[@]}" --entitlements "$APP_ENTITLEMENTS" "$APP_ROOT"
 
 echo "$APP_ROOT"
