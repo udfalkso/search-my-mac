@@ -1,4 +1,5 @@
 @preconcurrency import AppKit
+@preconcurrency import QuickLookUI
 import SearchMyMacCore
 import SwiftUI
 
@@ -32,6 +33,8 @@ struct ContentView: View {
                         OnboardingView()
                     } else if model.query.isEmpty {
                         EmptySearchView()
+                    } else if model.results.isEmpty && model.isSearching {
+                        SearchLoadingView()
                     } else if model.results.isEmpty && !model.isSearching {
                         EmptyResultsView()
                     } else {
@@ -556,74 +559,91 @@ private struct SidebarView: View {
     @State private var hoveredSavedSearchID: String?
     @State private var pendingRootRemoval: IndexRoot?
 
-    private func showSearchResults() {
-        withAnimation(.easeOut(duration: 0.18)) {
-            selection = .allFiles
-        }
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             List(selection: $selection) {
                 Section {
-                    Label("All Files", systemImage: "doc.text.magnifyingglass").tag(SidebarSelection.allFiles)
-                }
-                if !model.roots.isEmpty {
-                    Section {
-                        ForEach(model.roots) { root in
-                            HStack(spacing: 8) {
-                                Label(root.displayName, systemImage: root.isAvailable ? "folder" : "externaldrive.badge.exclamationmark")
-                                Spacer()
-                                Button {
-                                    pendingRootRemoval = root
-                                } label: {
-                                    Image(systemName: "minus.circle")
-                                        .frame(width: 20, height: 20)
-                                        .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                .opacity(hoveredRootID == root.id ? 1 : 0)
-                                .allowsHitTesting(hoveredRootID == root.id)
-                                .accessibilityHidden(hoveredRootID != root.id)
-                                .help("Remove \(root.displayName) from the index")
+                    Button {
+                        selection = .allFiles
+                        model.filters.rootIDs.removeAll()
+                        model.filters.pathPrefixes.removeAll()
+                        model.scheduleSearch()
+                    } label: {
+                        Label("All Indexed Files", systemImage: "doc.text.magnifyingglass")
+                            .fontWeight(.medium)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .tag(SidebarSelection.allFiles)
+
+                    ForEach(model.roots) { root in
+                        HStack(spacing: 8) {
+                            Button {
+                                selection = .root(root.id)
+                                model.filters.rootIDs = [root.id]
+                                model.filters.pathPrefixes.removeAll()
+                                model.scheduleSearch()
+                            } label: {
+                                Label(
+                                    root.displayName,
+                                    systemImage: root.isAvailable ? "folder" : "externaldrive.badge.exclamationmark"
+                                )
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
                             }
-                                .tag(SidebarSelection.root(root.id))
-                                .onHover { hovering in
-                                    withAnimation(.easeOut(duration: 0.12)) {
-                                        hoveredRootID = hovering ? root.id : nil
-                                    }
-                                }
-                                .contextMenu {
-                                    Button("Remove from Index…", role: .destructive) {
-                                        pendingRootRemoval = root
-                                    }
-                                }
-                        }
-                    } header: {
-                        HStack {
-                            Text("Locations")
+                            .buttonStyle(.plain)
                             Spacer()
                             Button {
-                                model.chooseAndIndexFolder()
+                                pendingRootRemoval = root
                             } label: {
-                                Image(systemName: "plus")
-                                    .font(.caption.bold())
+                                Image(systemName: "minus.circle")
                                     .frame(width: 20, height: 20)
                                     .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
-                            .help("Add a Location")
-                            .accessibilityLabel("Add a Location")
-                            .accessibilityHint("Choose another folder to index")
+                            .opacity(hoveredRootID == root.id ? 1 : 0)
+                            .allowsHitTesting(hoveredRootID == root.id)
+                            .accessibilityHidden(hoveredRootID != root.id)
+                            .help("Remove \(root.displayName) from the index")
                         }
+                        .tag(SidebarSelection.root(root.id))
+                        .onHover { hovering in
+                            withAnimation(.easeOut(duration: 0.12)) {
+                                hoveredRootID = hovering ? root.id : nil
+                            }
+                        }
+                        .contextMenu {
+                            Button("Remove from Index…", role: .destructive) {
+                                pendingRootRemoval = root
+                            }
+                        }
+                    }
+                } header: {
+                    HStack {
+                        Text("Search")
+                        Spacer()
+                        Button {
+                            model.chooseAndIndexFolder()
+                        } label: {
+                            Image(systemName: "plus")
+                                .font(.caption.bold())
+                                .frame(width: 20, height: 20)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Add a Search Location")
+                        .accessibilityLabel("Add a Search Location")
                     }
                 }
                 if !model.savedSearches.isEmpty {
-                    Section("Saved") {
+                    Section("Saved Searches") {
                         ForEach(model.savedSearches) { saved in
                             HStack(spacing: 8) {
                                 Button {
-                                    showSearchResults()
+                                    withAnimation(.easeOut(duration: 0.18)) {
+                                        selection = .saved(saved.id)
+                                    }
                                     model.useSavedSearch(saved)
                                 } label: {
                                     Label(saved.name, systemImage: saved.isPinned ? "pin.fill" : "bookmark")
@@ -666,7 +686,9 @@ private struct SidebarView: View {
                     Section {
                         ForEach(model.history.prefix(15)) { entry in
                             Button {
-                                showSearchResults()
+                                withAnimation(.easeOut(duration: 0.18)) {
+                                    selection = .history(entry.id)
+                                }
                                 model.useHistory(entry)
                             } label: {
                                 Label(entry.query, systemImage: "clock")
@@ -679,7 +701,7 @@ private struct SidebarView: View {
                         }
                     } header: {
                         HStack {
-                            Text("History")
+                            Text("Recent Searches")
                             Spacer()
                             Button {
                                 showsClearHistoryConfirmation = true
@@ -751,6 +773,8 @@ private struct SearchToolbar: View {
     @EnvironmentObject private var model: AppModel
     @AppStorage("semanticTip.dismissedPhase") private var dismissedSemanticTipPhase = ""
     @FocusState private var focused: Bool
+    @State private var showsFilters = false
+    @State private var showsAdvanced = false
 
     var body: some View {
         VStack(spacing: 10) {
@@ -781,120 +805,66 @@ private struct SearchToolbar: View {
             .frame(height: 44)
             .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 11))
 
-            HStack {
-                Picker("Mode", selection: Binding(
-                    get: { model.mode },
-                    set: { model.mode = $0 }
-                )) {
-                    Text("Text").tag(SearchMode.text)
-                    Text("Semantic").tag(SearchMode.semantic)
-                    Text("Hybrid").tag(SearchMode.hybrid)
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 250)
-                .onChange(of: model.mode) { _ in model.scheduleSearch() }
-                Spacer()
-                Menu {
-                    Section("Common Folders") {
-                        ForEach(commonFolders, id: \.path) { folder in
-                            Toggle(folder.lastPathComponent, isOn: Binding(
-                                get: { model.filters.pathPrefixes.contains(folder.path) },
-                                set: { enabled in
-                                    if enabled { model.filters.pathPrefixes.insert(folder.path) }
-                                    else { model.filters.pathPrefixes.remove(folder.path) }
-                                    model.scheduleSearch()
-                                }
-                            ))
-                        }
-                    }
-                    Section("Indexed Roots") {
-                    ForEach(model.roots) { root in
-                        Toggle(root.displayName, isOn: Binding(
-                            get: { model.filters.rootIDs.contains(root.id) },
-                            set: { enabled in
-                                if enabled { model.filters.rootIDs.insert(root.id) }
-                                else { model.filters.rootIDs.remove(root.id) }
-                                model.scheduleSearch()
-                            }
-                        ))
-                    }
-                    }
+            HStack(spacing: 8) {
+                Button {
+                    showsFilters.toggle()
                 } label: {
-                    FilterMenuLabel(
-                        title: selectedLocationsSummary,
-                        symbol: model.filters.rootIDs.isEmpty && model.filters.pathPrefixes.isEmpty
-                            ? "folder"
-                            : "folder.fill",
-                        maximumWidth: 150
+                    Label(
+                        activeFilterCount == 0 ? "Filters" : "Filters (\(activeFilterCount))",
+                        systemImage: activeFilterCount == 0
+                            ? "line.3.horizontal.decrease.circle"
+                            : "line.3.horizontal.decrease.circle.fill"
                     )
                 }
-                .help(locationsHelp)
-                Menu {
-                    if !model.filters.extensions.isEmpty {
-                        Section {
-                            Text("Selected: \(selectedFileTypesSummary)")
-                            Button("Clear File Types") {
+                .popover(isPresented: $showsFilters, arrowEdge: .bottom) {
+                    SearchFiltersPopover(isPresented: $showsFilters)
+                        .environmentObject(model)
+                }
+                .help(activeFilterCount == 0 ? "Narrow results by location, file type, or date" : activeFiltersHelp)
+
+                Button {
+                    showsAdvanced.toggle()
+                } label: {
+                    Label("Advanced", systemImage: "slider.horizontal.3")
+                }
+                .popover(isPresented: $showsAdvanced, arrowEdge: .bottom) {
+                    AdvancedSearchPopover(isPresented: $showsAdvanced)
+                        .environmentObject(model)
+                }
+                .help("Choose how Search My Mac finds and ranks results. Hybrid is recommended.")
+
+                Spacer()
+            }
+
+            if activeFilterCount > 0 {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(selectedRootFilters) { root in
+                            FilterChip(title: root.displayName, symbol: "folder") {
+                                model.filters.rootIDs.remove(root.id)
+                                model.scheduleSearch()
+                            }
+                        }
+                        ForEach(model.filters.pathPrefixes.sorted(), id: \.self) { path in
+                            FilterChip(title: URL(fileURLWithPath: path).lastPathComponent, symbol: "folder") {
+                                model.filters.pathPrefixes.remove(path)
+                                model.scheduleSearch()
+                            }
+                        }
+                        if !model.filters.extensions.isEmpty {
+                            FilterChip(title: selectedFileTypesSummary, symbol: "doc") {
                                 model.filters.extensions.removeAll()
                                 model.scheduleSearch()
                             }
                         }
-                    }
-                    Section("Types") {
-                    ForEach(["pdf", "docx", "xlsx", "pptx", "md", "txt"], id: \.self) { ext in
-                        Toggle(ext.uppercased(), isOn: Binding(
-                            get: { model.filters.extensions.contains(ext) },
-                            set: { enabled in
-                                if enabled { model.filters.extensions.insert(ext) }
-                                else { model.filters.extensions.remove(ext) }
-                                model.scheduleSearch()
+                        if hasDateFilter {
+                            FilterChip(title: modifiedFilterSummary, symbol: "calendar") {
+                                clearDateFilter()
                             }
-                        ))
+                        }
                     }
-                    }
-                    Section("Images") {
-                    ForEach(["jpg", "jpeg", "png", "heic", "tiff"], id: \.self) { ext in
-                        Toggle(ext.uppercased(), isOn: Binding(
-                            get: { model.filters.extensions.contains(ext) },
-                            set: { enabled in
-                                if enabled { model.filters.extensions.insert(ext) }
-                                else { model.filters.extensions.remove(ext) }
-                                model.scheduleSearch()
-                            }
-                        ))
-                    }
-                    }
-                } label: {
-                    FilterMenuLabel(
-                        title: model.filters.extensions.isEmpty
-                            ? "All File Types"
-                            : selectedFileTypesSummary,
-                        symbol: model.filters.extensions.isEmpty
-                            ? "line.3.horizontal.decrease.circle"
-                            : "line.3.horizontal.decrease.circle.fill",
-                        maximumWidth: 150
-                    )
                 }
-                .help(fileTypesHelp)
-                Menu {
-                    Button("Any Time") {
-                        model.filters.modifiedAfter = nil
-                        model.filters.modifiedBefore = nil
-                        model.scheduleSearch()
-                    }
-                    Button("Past 24 Hours") { setModifiedAfter(days: -1) }
-                    Button("Past Week") { setModifiedAfter(days: -7) }
-                    Button("Past Month") { setModifiedAfter(months: -1) }
-                    Button("Past Year") { setModifiedAfter(years: -1) }
-                } label: {
-                    FilterMenuLabel(
-                        title: modifiedFilterSummary,
-                        symbol: model.filters.modifiedAfter == nil && model.filters.modifiedBefore == nil
-                            ? "calendar"
-                            : "calendar.badge.clock",
-                        maximumWidth: 130
-                    )
-                }
-                .help("Modified: \(modifiedFilterSummary)")
+                .transition(.move(edge: .top).combined(with: .opacity))
             }
             if shouldShowSemanticTip {
                 SemanticModeTip {
@@ -906,6 +876,7 @@ private struct SearchToolbar: View {
         .padding(14)
         .animation(.easeOut(duration: 0.18), value: model.semanticStatus.isSearchReady)
         .animation(.easeOut(duration: 0.18), value: model.mode)
+        .animation(.easeOut(duration: 0.18), value: activeFilterCount)
         .animation(.easeOut(duration: 0.18), value: shouldShowSemanticTip)
         .onChange(of: model.semanticStatus.phase) { phase in
             if dismissedSemanticTipPhase != phase.rawValue {
@@ -932,13 +903,34 @@ private struct SearchToolbar: View {
             Double(model.semanticStatus.totalPassages) >= 0.9
     }
 
-    private var commonFolders: [URL] {
-        let manager = FileManager.default
-        return [
-            manager.urls(for: .desktopDirectory, in: .userDomainMask).first,
-            manager.urls(for: .documentDirectory, in: .userDomainMask).first,
-            manager.urls(for: .downloadsDirectory, in: .userDomainMask).first
-        ].compactMap { $0 }
+    private var activeFilterCount: Int {
+        selectedRootFilters.count + model.filters.pathPrefixes.count
+            + (model.filters.extensions.isEmpty ? 0 : 1)
+            + (hasDateFilter ? 1 : 0)
+    }
+
+    private var selectedRootFilters: [IndexRoot] {
+        model.roots.filter { model.filters.rootIDs.contains($0.id) }
+    }
+
+    private var hasDateFilter: Bool {
+        model.filters.modifiedAfter != nil || model.filters.modifiedBefore != nil
+    }
+
+    private var activeFiltersHelp: String {
+        [
+            selectedLocationsSummary == "All Locations" ? nil : selectedLocationsSummary,
+            model.filters.extensions.isEmpty ? nil : selectedFileTypesSummary,
+            hasDateFilter ? modifiedFilterSummary : nil
+        ]
+        .compactMap { $0 }
+        .joined(separator: " · ")
+    }
+
+    private func clearDateFilter() {
+        model.filters.modifiedAfter = nil
+        model.filters.modifiedBefore = nil
+        model.scheduleSearch()
     }
 
     private var saveSearchHelp: String {
@@ -961,18 +953,6 @@ private struct SearchToolbar: View {
         }
         let names = Array(Set(rootNames + folderNames)).sorted()
         return names.isEmpty ? "All Locations" : names.joined(separator: ", ")
-    }
-
-    private var locationsHelp: String {
-        model.filters.rootIDs.isEmpty && model.filters.pathPrefixes.isEmpty
-            ? "Search all indexed locations"
-            : "Searching: \(selectedLocationsSummary)"
-    }
-
-    private var fileTypesHelp: String {
-        model.filters.extensions.isEmpty
-            ? "Search all file types"
-            : "Filtering by \(selectedFileTypesSummary)"
     }
 
     private var modifiedFilterSummary: String {
@@ -1002,10 +982,320 @@ private struct SearchToolbar: View {
         return "Since \(after.formatted(date: .abbreviated, time: .omitted))"
     }
 
-    private func setModifiedAfter(days: Int = 0, months: Int = 0, years: Int = 0) {
-        model.filters.modifiedAfter = Calendar.current.date(byAdding: DateComponents(year: years, month: months, day: days), to: .now)
-        model.filters.modifiedBefore = nil
-        model.scheduleSearch()
+}
+
+private struct SearchFiltersPopover: View {
+    @EnvironmentObject private var model: AppModel
+    @Binding var isPresented: Bool
+
+    private let documentExtensions = ["pdf", "docx", "xlsx", "pptx", "md", "txt"]
+    private let imageExtensions = ["jpg", "jpeg", "png", "heic", "tiff"]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Label("Filters", systemImage: "line.3.horizontal.decrease.circle")
+                    .font(.headline)
+                Spacer()
+                if hasActiveFilters {
+                    Text("Updates results immediately")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(14)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    GroupBox {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Common Folders")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                            ForEach(commonFolders, id: \.path) { folder in
+                                Toggle(isOn: pathFilterBinding(folder.path)) {
+                                    Label(folder.lastPathComponent, systemImage: "folder")
+                                }
+                                .toggleStyle(.checkbox)
+                            }
+
+                            if !model.roots.isEmpty {
+                                Divider().padding(.vertical, 2)
+                                Text("Indexed Locations")
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(.secondary)
+                                ForEach(model.roots) { root in
+                                    Toggle(isOn: rootFilterBinding(root.id)) {
+                                        Label(
+                                            root.displayName,
+                                            systemImage: root.isAvailable ? "externaldrive" : "externaldrive.badge.exclamationmark"
+                                        )
+                                    }
+                                    .toggleStyle(.checkbox)
+                                }
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    } label: {
+                        Label("Locations", systemImage: "folder")
+                    }
+
+                    GroupBox {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Documents")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                            fileTypeGrid(documentExtensions)
+                            Text("Images")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                                .padding(.top, 2)
+                            fileTypeGrid(imageExtensions)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    } label: {
+                        Label("File Type", systemImage: "doc")
+                    }
+
+                    GroupBox {
+                        Picker("Date Modified", selection: dateFilterBinding) {
+                            ForEach(ModifiedDateFilter.standardCases) { preset in
+                                Text(preset.title).tag(preset)
+                            }
+                            if dateFilter == .custom {
+                                Text(ModifiedDateFilter.custom.title).tag(ModifiedDateFilter.custom)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.radioGroup)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    } label: {
+                        Label("Date Modified", systemImage: "calendar")
+                    }
+                }
+                .padding(14)
+            }
+
+            Divider()
+
+            HStack {
+                Button("Clear All") {
+                    model.filters = SearchFilters()
+                    model.scheduleSearch()
+                }
+                .disabled(!hasActiveFilters)
+                Spacer()
+                Button("Done") { isPresented = false }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(12)
+        }
+        .frame(width: 390, height: 510)
+    }
+
+    private var hasActiveFilters: Bool {
+        !model.filters.rootIDs.isEmpty || !model.filters.pathPrefixes.isEmpty
+            || !model.filters.extensions.isEmpty || model.filters.modifiedAfter != nil
+            || model.filters.modifiedBefore != nil
+    }
+
+    private var commonFolders: [URL] {
+        let manager = FileManager.default
+        return [
+            manager.urls(for: .desktopDirectory, in: .userDomainMask).first,
+            manager.urls(for: .documentDirectory, in: .userDomainMask).first,
+            manager.urls(for: .downloadsDirectory, in: .userDomainMask).first
+        ].compactMap { $0 }
+    }
+
+    private var dateFilter: ModifiedDateFilter {
+        guard model.filters.modifiedBefore == nil, let after = model.filters.modifiedAfter else {
+            return model.filters.modifiedBefore == nil ? .anyTime : .custom
+        }
+        let calendar = Calendar.current
+        let candidates: [(ModifiedDateFilter, DateComponents)] = [
+            (.pastDay, DateComponents(day: -1)),
+            (.pastWeek, DateComponents(day: -7)),
+            (.pastMonth, DateComponents(month: -1)),
+            (.pastYear, DateComponents(year: -1))
+        ]
+        for (preset, components) in candidates {
+            if let expected = calendar.date(byAdding: components, to: .now),
+               abs(expected.timeIntervalSince(after)) < 600 {
+                return preset
+            }
+        }
+        return .custom
+    }
+
+    private var dateFilterBinding: Binding<ModifiedDateFilter> {
+        Binding(
+            get: { dateFilter },
+            set: { preset in
+                guard preset != .custom else { return }
+                model.filters.modifiedBefore = nil
+                model.filters.modifiedAfter = preset.dateComponents.flatMap {
+                    Calendar.current.date(byAdding: $0, to: .now)
+                }
+                model.scheduleSearch()
+            }
+        )
+    }
+
+    private func rootFilterBinding(_ rootID: String) -> Binding<Bool> {
+        Binding(
+            get: { model.filters.rootIDs.contains(rootID) },
+            set: { enabled in
+                if enabled { model.filters.rootIDs.insert(rootID) }
+                else { model.filters.rootIDs.remove(rootID) }
+                model.scheduleSearch()
+            }
+        )
+    }
+
+    private func pathFilterBinding(_ path: String) -> Binding<Bool> {
+        Binding(
+            get: { model.filters.pathPrefixes.contains(path) },
+            set: { enabled in
+                if enabled { model.filters.pathPrefixes.insert(path) }
+                else { model.filters.pathPrefixes.remove(path) }
+                model.scheduleSearch()
+            }
+        )
+    }
+
+    private func extensionFilterBinding(_ fileExtension: String) -> Binding<Bool> {
+        Binding(
+            get: { model.filters.extensions.contains(fileExtension) },
+            set: { enabled in
+                if enabled { model.filters.extensions.insert(fileExtension) }
+                else { model.filters.extensions.remove(fileExtension) }
+                model.scheduleSearch()
+            }
+        )
+    }
+
+    private func fileTypeGrid(_ fileExtensions: [String]) -> some View {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], alignment: .leading, spacing: 7) {
+            ForEach(fileExtensions, id: \.self) { fileExtension in
+                Toggle(fileExtension.uppercased(), isOn: extensionFilterBinding(fileExtension))
+                    .toggleStyle(.checkbox)
+            }
+        }
+    }
+}
+
+private enum ModifiedDateFilter: String, Identifiable {
+    case anyTime
+    case pastDay
+    case pastWeek
+    case pastMonth
+    case pastYear
+    case custom
+
+    static let standardCases: [ModifiedDateFilter] = [.anyTime, .pastDay, .pastWeek, .pastMonth, .pastYear]
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .anyTime: "Any Time"
+        case .pastDay: "Past 24 Hours"
+        case .pastWeek: "Past Week"
+        case .pastMonth: "Past Month"
+        case .pastYear: "Past Year"
+        case .custom: "Custom Date Range"
+        }
+    }
+
+    var dateComponents: DateComponents? {
+        switch self {
+        case .anyTime, .custom: nil
+        case .pastDay: DateComponents(day: -1)
+        case .pastWeek: DateComponents(day: -7)
+        case .pastMonth: DateComponents(month: -1)
+        case .pastYear: DateComponents(year: -1)
+        }
+    }
+}
+
+private struct AdvancedSearchPopover: View {
+    @EnvironmentObject private var model: AppModel
+    @Binding var isPresented: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Label("Advanced Search", systemImage: "slider.horizontal.3")
+                    .font(.headline)
+                Spacer()
+            }
+            .padding(14)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Search Method")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Picker("Search Method", selection: modeBinding) {
+                    Text("Hybrid — Best overall").tag(SearchMode.hybrid)
+                    Text("Text — Exact words").tag(SearchMode.text)
+                    Text("Semantic — Similar meaning").tag(SearchMode.semantic)
+                }
+                .labelsHidden()
+                .pickerStyle(.radioGroup)
+
+                Text(modeDescription)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Divider()
+
+                HStack {
+                    Label("Semantic search runs privately on this Mac.", systemImage: "lock.shield")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    SemanticSettingsShortcut(label: "Settings…", symbol: "gear")
+                }
+            }
+            .padding(14)
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Done") { isPresented = false }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(12)
+        }
+        .frame(width: 360)
+    }
+
+    private var modeBinding: Binding<SearchMode> {
+        Binding(
+            get: { model.mode },
+            set: { mode in
+                model.mode = mode
+                model.scheduleSearch()
+            }
+        )
+    }
+
+    private var modeDescription: String {
+        switch model.mode {
+        case .hybrid:
+            "Combines exact wording with related meaning. This is the recommended choice for most searches."
+        case .text:
+            "Prioritizes filenames and document text containing the words you typed."
+        case .semantic:
+            "Finds documents with related meaning, even when they use different words."
+        }
     }
 }
 
@@ -1057,8 +1347,8 @@ private struct SemanticModeTip: View {
             "Preparing semantic search"
         case .indexing:
             model.semanticStatus.isSearchReady
-                ? "Semantic coverage is growing"
-                : "Preparing the first semantic results"
+                ? "Semantic search is ready"
+                : "Preparing semantic search"
         case .paused:
             "Semantic indexing is paused"
         case .failed:
@@ -1073,18 +1363,18 @@ private struct SemanticModeTip: View {
         case .notInstalled:
             "Semantic and Hybrid modes use a private, on-device Qwen model. Until enabled, results use text matching."
         case .downloading:
-            "The local Qwen model is downloading. Results will switch over as soon as the first sections are ready."
+            "The private, on-device model is downloading. Text results remain available in the meantime."
         case .loading:
             "The local model is loading. Text results remain available in the meantime."
         case .indexing:
             if model.semanticStatus.isSearchReady {
-                "\(semanticCoverage) sections are ready. \(selectedModeName) search is active and will improve as indexing continues."
+                "\(selectedModeName) search is active and will quietly improve as more of your library becomes ready."
             } else {
-                "The first document sections are being prepared. Text results remain available in the meantime."
+                "Your documents are being prepared privately on this Mac. Text results remain available in the meantime."
             }
         case .paused:
             model.semanticStatus.isSearchReady
-                ? "\(semanticCoverage) sections are ready. Resume indexing to improve coverage."
+                ? "Semantic results are available. Resume preparation to improve them across more documents."
                 : "Resume indexing to make Semantic and Hybrid results available."
         case .failed:
             "Open Semantic Settings to see what went wrong and try again."
@@ -1102,10 +1392,6 @@ private struct SemanticModeTip: View {
         case .failed: "exclamationmark.triangle"
         case .ready: "brain.head.profile"
         }
-    }
-
-    private var semanticCoverage: String {
-        "\(model.semanticStatus.embeddedPassages.formatted()) of \(model.semanticStatus.totalPassages.formatted())"
     }
 
     private var selectedModeName: String {
@@ -1141,19 +1427,32 @@ private struct SemanticModeTip: View {
     }
 }
 
-private struct FilterMenuLabel: View {
+private struct FilterChip: View {
     let title: String
     let symbol: String
-    let maximumWidth: CGFloat
+    let remove: () -> Void
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 5) {
             Image(systemName: symbol)
+                .font(.caption2)
             Text(title)
                 .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: maximumWidth, alignment: .leading)
+            Button(action: remove) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .semibold))
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Remove \(title) filter")
+            .accessibilityLabel("Remove \(title) filter")
         }
+        .font(.caption)
+        .padding(.leading, 8)
+        .padding(.trailing, 4)
+        .frame(height: 24)
+        .background(.quaternary.opacity(0.7), in: Capsule())
     }
 }
 
@@ -1189,63 +1488,104 @@ private struct SemanticSettingsShortcut: View {
 private struct ResultsView: View {
     @EnvironmentObject private var model: AppModel
     @FocusState private var resultsFocused: Bool
+    @State private var showsPreview = false
 
     var body: some View {
-        ScrollViewReader { proxy in
-            List(selection: $model.selectedHitPath) {
-                ForEach(model.results, id: \.path) { hit in
-                    ResultRow(hit: hit, isSelected: model.selectedHitPath == hit.path)
-                        .tag(hit.path)
-                        .id(hit.path)
-                        .listRowBackground(model.selectedHitPath == hit.path ? Color.accentColor : Color.clear)
-                        .contentShape(Rectangle())
-                        .simultaneousGesture(
-                            TapGesture().onEnded {
-                                model.selectedHitPath = hit.path
-                                focusResults()
-                                if NSApplication.shared.currentEvent?.clickCount == 2 {
-                                    model.open(hit)
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Text(resultSummary)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                if groupedCopyCount > 0 {
+                    Text("\(groupedCopyCount) similar \(groupedCopyCount == 1 ? "copy" : "copies") grouped")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer()
+                ShortcutHint(keys: "↑↓", label: "Select")
+                ShortcutHint(keys: "↩", label: "Open")
+                ShortcutHint(keys: "Space", label: "Quick Look")
+                Button {
+                    withAnimation(.easeOut(duration: 0.2)) { showsPreview.toggle() }
+                } label: {
+                    Label(showsPreview ? "Hide Preview" : "Preview", systemImage: "sidebar.trailing")
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .disabled(selectedHit == nil)
+                .help(showsPreview ? "Hide the preview pane" : "Show a preview without leaving your search")
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 34)
+            .background(.bar)
+
+            HSplitView {
+                ScrollViewReader { proxy in
+                    List(selection: $model.selectedHitPath) {
+                        ForEach(resultGroups) { group in
+                            ResultGroupRow(group: group)
+                                .tag(group.primary.path)
+                                .id(group.primary.path)
+                                .listRowBackground(
+                                    model.selectedHitPath == group.primary.path
+                                        ? Color.accentColor.opacity(0.14)
+                                        : Color.clear
+                                )
+                                .contentShape(Rectangle())
+                                .simultaneousGesture(
+                                    TapGesture().onEnded {
+                                        model.selectedHitPath = group.primary.path
+                                        focusResults()
+                                        if NSApplication.shared.currentEvent?.clickCount == 2 {
+                                            model.open(group.primary)
+                                        }
+                                    }
+                                )
+                                .contextMenu {
+                                    resultContextMenu(group.primary)
                                 }
-                            }
-                        )
-                        .contextMenu {
-                            Button { model.quickLook(hit) } label: { Label("Quick Look", systemImage: "eye") }
-                            Button { model.open(hit) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
-                            Button { model.reveal(hit) } label: { Label("Reveal in Finder", systemImage: "folder") }
-                            Button { copyPath(hit.path) } label: { Label("Copy Path", systemImage: "doc.on.doc") }
                         }
+                    }
+                    .listStyle(.inset)
+                    .focusable()
+                    .focused($resultsFocused)
+                    .onChange(of: model.selectedHitPath) { path in
+                        guard let path else { return }
+                        withAnimation(.easeOut(duration: 0.12)) {
+                            proxy.scrollTo(path, anchor: .center)
+                        }
+                    }
+                }
+
+                if showsPreview, let selectedHit {
+                    ResultPreviewPane(hit: selectedHit)
+                        .frame(minWidth: 280, idealWidth: 360, maxWidth: 480)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
-            .listStyle(.inset)
-            .focusable()
-            .focused($resultsFocused)
             .background(
                 ResultsKeyboardMonitor(
                     toggleQuickLook: toggleQuickLook,
-                    moveQuickLookSelection: { model.moveQuickLookSelection(by: $0) }
+                    openSelection: openSelection,
+                    beginNavigation: beginNavigation,
+                    moveSelection: moveSelection
                 )
                 .frame(width: 0, height: 0)
             )
-            .overlay(alignment: .topLeading) {
-                ProgressView()
-                    .controlSize(.small)
-                    .padding(10)
-                    .background(.thinMaterial, in: Circle())
-                    .padding(.leading, 14)
-                    .padding(.top, 12)
-                    .opacity(model.showsSearchSpinner ? 1 : 0)
-                    .animation(.easeOut(duration: 0.1), value: model.showsSearchSpinner)
-                    .allowsHitTesting(false)
-                    .accessibilityLabel("Searching")
-                    .accessibilityHidden(!model.showsSearchSpinner)
-            }
-            .onChange(of: model.selectedHitPath) { path in
-                guard QuickLookController.shared.isVisible, let path else { return }
-                withAnimation(.easeOut(duration: 0.12)) {
-                    proxy.scrollTo(path, anchor: .center)
-                }
-            }
         }
+    }
+
+    private var resultGroups: [ResultGroup] {
+        ResultGroup.group(model.results)
+    }
+
+    private var groupedCopyCount: Int {
+        resultGroups.reduce(0) { $0 + $1.copies.count }
+    }
+
+    private var resultSummary: String {
+        let visible = resultGroups.count
+        return "\(visible.formatted()) \(visible == 1 ? "result" : "results")"
     }
 
     private var selectedHit: SearchHit? {
@@ -1266,9 +1606,216 @@ private struct ResultsView: View {
         return true
     }
 
+    private func openSelection() -> Bool {
+        guard let selected = selectedHit else { return false }
+        model.open(selected)
+        return true
+    }
+
+    private func beginNavigation() -> Bool {
+        guard let first = resultGroups.first?.primary else { return false }
+        if model.selectedHitPath == nil {
+            model.selectedHitPath = first.path
+        }
+        focusResults()
+        return true
+    }
+
+    private func moveSelection(_ offset: Int) -> Bool {
+        let visibleHits = resultGroups.map(\.primary)
+        guard !visibleHits.isEmpty else { return false }
+        let currentIndex = model.selectedHitPath.flatMap { path in
+            visibleHits.firstIndex { $0.path == path }
+        } ?? (offset > 0 ? -1 : visibleHits.count)
+        let nextIndex = min(max(currentIndex + offset, 0), visibleHits.count - 1)
+        guard nextIndex != currentIndex else { return true }
+        let nextHit = visibleHits[nextIndex]
+        model.selectedHitPath = nextHit.path
+        QuickLookController.shared.updateIfVisible(nextHit.url)
+        return true
+    }
+
+    @ViewBuilder
+    private func resultContextMenu(_ hit: SearchHit) -> some View {
+        Button { model.quickLook(hit) } label: { Label("Quick Look", systemImage: "eye") }
+        Button { model.open(hit) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
+        Button { model.reveal(hit) } label: { Label("Reveal in Finder", systemImage: "folder") }
+        Button { copyPath(hit.path) } label: { Label("Copy Path", systemImage: "doc.on.doc") }
+    }
+
     private func copyPath(_ path: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(path, forType: .string)
+    }
+}
+
+private struct ResultGroup: Identifiable {
+    let primary: SearchHit
+    let copies: [SearchHit]
+    var id: String { primary.path }
+
+    static func group(_ hits: [SearchHit]) -> [ResultGroup] {
+        var groups: [(key: String, hits: [SearchHit])] = []
+        var indices: [String: Int] = [:]
+        for hit in hits {
+            let key = duplicateSignature(for: hit)
+            if let index = indices[key] {
+                groups[index].hits.append(hit)
+            } else {
+                indices[key] = groups.count
+                groups.append((key, [hit]))
+            }
+        }
+        return groups.compactMap { group in
+            guard let primary = group.hits.first else { return nil }
+            return ResultGroup(primary: primary, copies: Array(group.hits.dropFirst()))
+        }
+    }
+
+    private static func duplicateSignature(for hit: SearchHit) -> String {
+        guard let snippet = hit.snippets.first?.text else { return hit.path }
+        let words = snippet
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        guard words.joined().count >= 48 else { return hit.path }
+        let content = words.prefix(32).joined(separator: " ")
+        let stem = hit.url.deletingPathExtension().lastPathComponent
+            .lowercased()
+            .replacingOccurrences(of: " copy", with: "")
+            .replacingOccurrences(of: " backup", with: "")
+        return "\(stem)|\(hit.fileExtension.lowercased())|\(content)"
+    }
+}
+
+private struct ResultGroupRow: View {
+    @EnvironmentObject private var model: AppModel
+    let group: ResultGroup
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ResultRow(hit: group.primary)
+            if !group.copies.isEmpty {
+                Menu {
+                    ForEach(group.copies, id: \.path) { copy in
+                        Button {
+                            model.open(copy)
+                        } label: {
+                            Text(copy.url.deletingLastPathComponent().path)
+                        }
+                    }
+                } label: {
+                    Label(
+                        "\(group.copies.count) similar \(group.copies.count == 1 ? "copy" : "copies")",
+                        systemImage: "doc.on.doc"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Open another copy of this document")
+                .padding(.leading, 50)
+                .padding(.bottom, 4)
+            }
+        }
+    }
+}
+
+private struct ShortcutHint: View {
+    let keys: String
+    let label: String
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(keys)
+                .font(.caption2.monospaced())
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
+            Text(label)
+                .font(.caption2)
+        }
+        .foregroundStyle(.secondary)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct ResultPreviewPane: View {
+    @EnvironmentObject private var model: AppModel
+    let hit: SearchHit
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 9) {
+                    Image(nsImage: NSWorkspace.shared.icon(forFile: hit.path))
+                        .resizable()
+                        .frame(width: 28, height: 28)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(hit.filename)
+                            .font(.headline)
+                            .lineLimit(1)
+                        Text(previewMetadata)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                Text(hit.url.deletingLastPathComponent().path)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(hit.path)
+            }
+            .padding(12)
+
+            Divider()
+
+            QuickLookPreview(url: hit.url)
+                .id(hit.path)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            Divider()
+
+            HStack(spacing: 8) {
+                Button("Open") { model.open(hit) }
+                Button("Reveal in Finder") { model.reveal(hit) }
+                Spacer()
+                Text("Space for Quick Look")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(10)
+        }
+        .background(.background)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var previewMetadata: String {
+        var parts: [String] = []
+        if !hit.fileExtension.isEmpty { parts.append(hit.fileExtension.uppercased()) }
+        if let modifiedAt = hit.modifiedAt {
+            parts.append("Modified \(modifiedAt.formatted(date: .abbreviated, time: .omitted))")
+        }
+        return parts.joined(separator: " · ")
+    }
+}
+
+private struct QuickLookPreview: NSViewRepresentable {
+    let url: URL
+
+    func makeNSView(context: Context) -> QLPreviewView {
+        let view = QLPreviewView(frame: .zero, style: .normal)
+        view?.autostarts = true
+        view?.previewItem = url as NSURL
+        return view ?? QLPreviewView(frame: .zero, style: .normal)!
+    }
+
+    func updateNSView(_ nsView: QLPreviewView, context: Context) {
+        nsView.previewItem = url as NSURL
+        nsView.refreshPreviewItem()
     }
 }
 
@@ -1278,63 +1825,124 @@ private struct ResultRow: View {
     @State private var isHovering = false
     @State private var fileIcon: NSImage
     let hit: SearchHit
-    let isSelected: Bool
 
-    init(hit: SearchHit, isSelected: Bool) {
+    init(hit: SearchHit) {
         self.hit = hit
-        self.isSelected = isSelected
         _fileIcon = State(initialValue: NSWorkspace.shared.icon(forFile: hit.path))
     }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Image(nsImage: fileIcon)
-                .resizable().frame(width: 38, height: 38)
-            VStack(alignment: .leading, spacing: 5) {
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 36, height: 36)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 8) {
-                    Text(hit.filename).font(.headline).lineLimit(1)
+                    Text(hit.filename)
+                        .font(.headline)
+                        .lineLimit(1)
                     AvailabilityBadge(availability: hit.availability)
                     Spacer()
-                    if let modified = hit.modifiedAt {
-                        Text(modified, style: .date)
-                            .font(.caption)
-                            .foregroundStyle(secondaryColor)
-                    }
                     ResultHoverActions(hit: hit)
                         .opacity(isHovering ? 1 : 0)
                         .animation(.easeOut(duration: 0.12), value: isHovering)
                         .allowsHitTesting(isHovering)
                         .accessibilityHidden(!isHovering)
                 }
-                Text(hit.url.deletingLastPathComponent().path)
-                    .font(.caption).foregroundStyle(secondaryColor).lineLimit(1).truncationMode(.middle)
-                ForEach(hit.snippets.prefix(3)) { snippet in
+                HStack(spacing: 5) {
+                    if !hit.fileExtension.isEmpty {
+                        Text(hit.fileExtension.uppercased())
+                    }
+                    Text(displayLocation)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if let modified = hit.modifiedAt {
+                        Text("·")
+                        Text(modified, style: .date)
+                    }
+                    Spacer()
+                    Text(matchReason)
+                        .foregroundStyle(secondaryColor.opacity(0.9))
+                }
+                .font(.caption)
+                .foregroundStyle(secondaryColor)
+
+                if let snippet = hit.snippets.first {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         if let label = snippet.locationLabel {
-                            Text(label).font(.caption2).foregroundStyle(secondaryColor).frame(minWidth: 42, alignment: .leading)
+                            Text(label)
+                                .font(.caption2)
+                                .foregroundStyle(secondaryColor)
+                                .fixedSize()
                         }
-                        Text(highlighted(snippet)).font(.callout).lineLimit(3)
+                        Text(highlighted(snippet))
+                            .font(.callout)
+                            .lineLimit(2)
+                            .lineSpacing(2)
                     }
                 }
             }
         }
-        .foregroundStyle(isSelected ? Color.white : Color.primary)
-        .padding(.vertical, 7)
+        .foregroundStyle(Color.primary)
+        .padding(.vertical, 8)
         .onHover { isHovering = $0 }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilitySummary)
     }
 
     private var secondaryColor: Color {
-        isSelected ? Color.white.opacity(0.78) : Color.secondary
+        Color.secondary
+    }
+
+    private var displayLocation: String {
+        let parent = hit.url.deletingLastPathComponent()
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if parent.path == home { return "Home" }
+        if parent.path.hasPrefix(home + "/") {
+            return parent.path.replacingOccurrences(of: home + "/", with: "")
+        }
+        return parent.path
+    }
+
+    private var matchReason: String {
+        let queryTerms = model.query
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { $0.count > 1 }
+        if queryTerms.contains(where: { hit.filename.localizedCaseInsensitiveContains($0) }) {
+            return "Filename match"
+        }
+        if hit.snippets.contains(where: { !$0.highlights.isEmpty }) {
+            return "Text match"
+        }
+        return model.effectiveMode == .text ? "Content match" : "Related content"
+    }
+
+    private var accessibilitySummary: String {
+        var summary = "\(hit.filename), \(matchReason), \(displayLocation)"
+        if let snippet = hit.snippets.first { summary += ", \(snippet.text)" }
+        return summary
     }
 
     private func highlighted(_ snippet: SearchSnippet) -> AttributedString {
         let value = NSMutableAttributedString(string: snippet.text)
+        if value.length > 360 {
+            let safeRange = (value.string as NSString).rangeOfComposedCharacterSequences(
+                for: NSRange(location: 0, length: 359)
+            )
+            value.replaceCharacters(
+                in: NSRange(location: safeRange.length, length: value.length - safeRange.length),
+                with: "…"
+            )
+        }
         let highlightOpacity: CGFloat = colorScheme == .dark ? 0.24 : 0.35
         for range in snippet.highlights {
-            guard range.location >= 0, range.length > 0, range.location + range.length <= value.length else { continue }
+            guard range.location >= 0, range.length > 0, range.location < value.length else { continue }
+            let clippedLength = min(range.length, value.length - range.location)
             value.addAttributes(
                 [.backgroundColor: NSColor.systemYellow.withAlphaComponent(highlightOpacity)],
-                range: NSRange(location: range.location, length: range.length)
+                range: NSRange(location: range.location, length: clippedLength)
             )
         }
         return AttributedString(value)
@@ -1373,12 +1981,16 @@ private struct ResultHoverActions: View {
 
 private struct ResultsKeyboardMonitor: NSViewRepresentable {
     let toggleQuickLook: () -> Bool
-    let moveQuickLookSelection: (Int) -> Bool
+    let openSelection: () -> Bool
+    let beginNavigation: () -> Bool
+    let moveSelection: (Int) -> Bool
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             toggleQuickLook: toggleQuickLook,
-            moveQuickLookSelection: moveQuickLookSelection
+            openSelection: openSelection,
+            beginNavigation: beginNavigation,
+            moveSelection: moveSelection
         )
     }
 
@@ -1389,7 +2001,9 @@ private struct ResultsKeyboardMonitor: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {
         context.coordinator.toggleQuickLook = toggleQuickLook
-        context.coordinator.moveQuickLookSelection = moveQuickLookSelection
+        context.coordinator.openSelection = openSelection
+        context.coordinator.beginNavigation = beginNavigation
+        context.coordinator.moveSelection = moveSelection
     }
 
     static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
@@ -1398,15 +2012,21 @@ private struct ResultsKeyboardMonitor: NSViewRepresentable {
 
     final class Coordinator {
         var toggleQuickLook: () -> Bool
-        var moveQuickLookSelection: (Int) -> Bool
+        var openSelection: () -> Bool
+        var beginNavigation: () -> Bool
+        var moveSelection: (Int) -> Bool
         private var monitor: Any?
 
         init(
             toggleQuickLook: @escaping () -> Bool,
-            moveQuickLookSelection: @escaping (Int) -> Bool
+            openSelection: @escaping () -> Bool,
+            beginNavigation: @escaping () -> Bool,
+            moveSelection: @escaping (Int) -> Bool
         ) {
             self.toggleQuickLook = toggleQuickLook
-            self.moveQuickLookSelection = moveQuickLookSelection
+            self.openSelection = openSelection
+            self.beginNavigation = beginNavigation
+            self.moveSelection = moveSelection
         }
 
         func install() {
@@ -1415,19 +2035,29 @@ private struct ResultsKeyboardMonitor: NSViewRepresentable {
                 guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty else {
                     return event
                 }
-                let isEditingText = MainActor.assumeIsolated {
-                    NSApplication.shared.keyWindow?.firstResponder is NSTextView
+                let isEditingSearchField = MainActor.assumeIsolated {
+                    guard let textView = NSApplication.shared.keyWindow?.firstResponder as? NSTextView else {
+                        return false
+                    }
+                    return textView.isFieldEditor
                 }
-                guard !isEditingText else { return event }
+                if isEditingSearchField {
+                    if event.keyCode == 125, self?.beginNavigation() == true {
+                        return nil
+                    }
+                    return event
+                }
 
                 let handled: Bool
                 switch event.keyCode {
                 case 49:
                     handled = self?.toggleQuickLook() == true
+                case 36, 76:
+                    handled = self?.openSelection() == true
                 case 125:
-                    handled = self?.moveQuickLookSelection(1) == true
+                    handled = self?.moveSelection(1) == true
                 case 126:
-                    handled = self?.moveQuickLookSelection(-1) == true
+                    handled = self?.moveSelection(-1) == true
                 default:
                     handled = false
                 }
@@ -1490,11 +2120,39 @@ private struct OnboardingView: View {
 
 private struct EmptySearchView: View {
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 14) {
             Image(systemName: "text.magnifyingglass").font(.system(size: 42)).foregroundStyle(.secondary)
-            Text("Search document contents, filenames, and paths").font(.title2)
-            Text("Use quotes for exact phrases, OR for alternatives, and -word to exclude.").foregroundStyle(.secondary)
+            Text("What are you looking for?").font(.title2)
+            Text("Search by a filename, a phrase you remember, or what the document was about.")
+                .foregroundStyle(.secondary)
+            HStack(spacing: 12) {
+                ShortcutHint(keys: "⌘F", label: "Search")
+                ShortcutHint(keys: "↑↓", label: "Choose")
+                ShortcutHint(keys: "Space", label: "Preview")
+            }
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+private struct SearchLoadingView: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Searching your documents…")
+                .font(.headline)
+            Text("Looking for the most useful matches for “\(model.query)”")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(40)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Searching for \(model.query)")
     }
 }
 
@@ -1502,11 +2160,44 @@ private struct EmptyResultsView: View {
     @EnvironmentObject private var model: AppModel
 
     var body: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 12) {
             Image(systemName: "questionmark.folder").font(.system(size: 42)).foregroundStyle(.secondary)
             Text(title).font(.title2)
-            Text(message).foregroundStyle(.secondary)
+            Text(message)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 480)
+            HStack(spacing: 8) {
+                if hasActiveFilters {
+                    Button("Clear Filters") {
+                        model.filters = SearchFilters()
+                        model.scheduleSearch(immediately: true)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                if model.mode == .semantic {
+                    Button("Use Hybrid Search") {
+                        model.mode = .hybrid
+                        model.scheduleSearch(immediately: true)
+                    }
+                } else if !model.query.isEmpty {
+                    Button("Try Fewer Words") {
+                        let words = model.query.split(whereSeparator: \.isWhitespace)
+                        if words.count > 1 {
+                            model.query = words.dropLast().joined(separator: " ")
+                            model.scheduleSearch(immediately: true, clearingResults: true)
+                        }
+                    }
+                    .disabled(model.query.split(whereSeparator: \.isWhitespace).count < 2)
+                }
+            }
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var hasActiveFilters: Bool {
+        !model.filters.rootIDs.isEmpty || !model.filters.pathPrefixes.isEmpty
+            || !model.filters.extensions.isEmpty || model.filters.modifiedAfter != nil
+            || model.filters.modifiedBefore != nil
     }
 
     private var title: String {
@@ -1514,7 +2205,11 @@ private struct EmptyResultsView: View {
     }
 
     private var message: String {
-        guard model.mode == .semantic else { return "Try fewer terms or broaden the active filters." }
+        guard model.mode == .semantic else {
+            return hasActiveFilters
+                ? "No files match both this search and the active filters. Try clearing a filter or using fewer words."
+                : "Try a broader phrase, check the spelling, or search for a filename you remember."
+        }
         if model.semanticStatus.embeddedPassages < model.semanticStatus.totalPassages {
             return "Semantic coverage is still growing. Try Text or Hybrid, or check again as indexing continues."
         }
@@ -1524,55 +2219,87 @@ private struct EmptyResultsView: View {
 
 private struct IndexStatusBar: View {
     @EnvironmentObject private var model: AppModel
+    @State private var showsDetails = false
 
     var body: some View {
         Divider()
-        // Keep a two-line footprint from the first paint. The detail itself
-        // fades rather than being inserted/removed, so startup state changes
-        // cannot make the window's bottom edge jump.
-        VStack(spacing: 5) {
+        HStack(spacing: 8) {
+            statusSymbol
+            Text(statusText)
+                .font(.caption.weight(isActivelyWorking ? .medium : .regular))
+                .foregroundStyle(model.progress.phase == .failed ? Color.primary : Color.secondary)
+                .lineLimit(1)
+            Spacer(minLength: 10)
+            Text(trailingCountText)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            if model.hasLoadedInitialState && model.progress.phase != .idle {
+                Button("Details") { showsDetails.toggle() }
+                    .font(.caption)
+                    .buttonStyle(.borderless)
+                    .popover(isPresented: $showsDetails, arrowEdge: .bottom) {
+                        indexingDetails
+                    }
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 30)
+        .accessibilityElement(children: .contain)
+    }
+
+    @ViewBuilder
+    private var statusSymbol: some View {
+        if showsActivityIndicator {
+            ProgressView()
+                .controlSize(.small)
+                .accessibilityLabel(model.hasLoadedInitialState ? "Indexing in progress" : "Opening search data")
+        } else {
+            Image(systemName: statusSymbolName)
+                .font(.caption)
+                .foregroundStyle(statusSymbolColor)
+                .accessibilityHidden(true)
+        }
+    }
+
+    private var indexingDetails: some View {
+        VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 9) {
-                if showsActivityIndicator {
-                    ProgressView()
-                        .controlSize(.small)
-                        .accessibilityLabel(model.hasLoadedInitialState ? "Indexing in progress" : "Opening search data")
+                statusSymbol
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(detailTitle)
+                        .font(.headline)
+                    if let activity = model.progress.currentActivity, !activity.isEmpty {
+                        Text(activity)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+                    }
                 }
-                Text(statusText)
-                    .font(.caption.weight(showsActivityIndicator ? .medium : .regular))
-                    .foregroundStyle(showsActivityIndicator ? .primary : .secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer(minLength: 10)
-                if model.progress.phase == .paused {
-                    Button("Resume") { model.resumeIndexing() }.font(.caption)
-                } else if isActivelyWorking {
-                    Button("Pause") { model.pauseIndexing() }.font(.caption)
-                }
-                Text(trailingCountText)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                Spacer()
             }
 
-            HStack(spacing: 9) {
-                Text(detailText)
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Spacer(minLength: 8)
+            Text(detailText)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+
+            HStack {
+                if model.progress.phase == .paused {
+                    Button("Resume Indexing") { model.resumeIndexing() }
+                        .buttonStyle(.borderedProminent)
+                } else if isActivelyWorking {
+                    Button("Pause Indexing") { model.pauseIndexing() }
+                }
+                Spacer()
                 if model.indexingRate >= 0.5 && isActivelyWorking {
                     Text("\(model.indexingRate.formatted(.number.precision(.fractionLength(0)))) files/sec")
-                        .font(.caption2.monospacedDigit())
+                        .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
             }
-            .frame(height: 13)
-            .opacity(detailIsVisible ? 1 : 0)
-            .accessibilityHidden(!detailIsVisible)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
-        .frame(height: 52)
-        .animation(.easeInOut(duration: 0.18), value: detailIsVisible)
+        .padding(16)
+        .frame(width: 330)
     }
 
     private var isActivelyWorking: Bool {
@@ -1586,44 +2313,61 @@ private struct IndexStatusBar: View {
         !model.hasLoadedInitialState || isActivelyWorking
     }
 
-    private var detailIsVisible: Bool {
-        !model.hasLoadedInitialState || model.progress.phase != .idle
-    }
-
     private var statusText: String {
-        guard model.hasLoadedInitialState else { return "Opening Search My Mac…" }
+        guard model.hasLoadedInitialState else { return "Getting search ready…" }
         return switch model.progress.phase {
         case .idle: model.roots.isEmpty
-            ? "Choose Home or a folder to begin"
-            : "Watching indexed locations for new and changed files"
-        case .discovering: "Discovering and indexing\(activitySuffix)"
-        case .extracting: "Indexing\(activitySuffix)"
-        case .committing: "Finishing updates…"
-        case .reconciling: "Checking for new and changed files…"
-        case .paused: model.progress.pauseReason ?? "Paused"
+            ? "Choose a location to begin"
+            : "Search is up to date"
+        case .discovering, .extracting, .committing, .reconciling: "Keeping search up to date…"
+        case .paused: "Indexing paused"
         case .failed: "Index needs attention"
         }
     }
 
-    private var activitySuffix: String {
-        guard let activity = model.progress.currentActivity, !activity.isEmpty else { return "" }
-        return " — \(activity)"
+    private var detailTitle: String {
+        switch model.progress.phase {
+        case .discovering: "Finding new documents"
+        case .extracting: "Making documents searchable"
+        case .committing: "Finishing updates"
+        case .reconciling: "Checking indexed locations"
+        case .paused: "Indexing is paused"
+        case .failed: "Indexing needs attention"
+        case .idle: "Search is up to date"
+        }
+    }
+
+    private var statusSymbolName: String {
+        switch model.progress.phase {
+        case .failed: "exclamationmark.triangle.fill"
+        case .paused: "pause.circle.fill"
+        case .idle: model.roots.isEmpty ? "magnifyingglass.circle" : "checkmark.circle.fill"
+        case .discovering, .extracting, .committing, .reconciling: "arrow.triangle.2.circlepath"
+        }
+    }
+
+    private var statusSymbolColor: Color {
+        switch model.progress.phase {
+        case .failed: .orange
+        case .idle where !model.roots.isEmpty: .green
+        default: .secondary
+        }
     }
 
     private var trailingCountText: String {
         guard model.hasLoadedInitialState else { return "Preparing…" }
         guard !model.roots.isEmpty else { return "No files yet" }
-        return "\(model.health.fileCount.formatted()) searchable"
+        return "\(model.health.fileCount.formatted()) files"
     }
 
     private var detailText: String {
         guard model.hasLoadedInitialState else {
-            return "Loading saved locations, settings, and search history"
+            return "Loading saved locations and preferences"
         }
         if model.progress.phase == .failed {
             return model.progress.pauseReason ?? "Open Index Health for details"
         }
         let queued = max(0, model.progress.discovered - model.progress.completed)
-        return "\(model.progress.completed.formatted()) checked this run • \(model.progress.discovered.formatted()) found so far • \(queued.formatted()) waiting"
+        return "\(model.progress.completed.formatted()) checked · \(model.progress.discovered.formatted()) found · \(queued.formatted()) waiting"
     }
 }

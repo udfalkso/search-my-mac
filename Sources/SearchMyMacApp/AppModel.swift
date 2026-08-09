@@ -62,7 +62,7 @@ final class AppModel: ObservableObject {
 
     init() {
         mode = UserDefaults.standard.string(forKey: Self.preferredSearchModeKey)
-            .flatMap(SearchMode.init(rawValue:)) ?? .text
+            .flatMap(SearchMode.init(rawValue:)) ?? .hybrid
         let storedHybridWeight = UserDefaults.standard.object(forKey: Self.hybridSemanticWeightKey) as? Double
         hybridSemanticWeight = min(max(storedHybridWeight ?? SearchRequest.defaultHybridSemanticWeight, 0), 1)
         do {
@@ -186,6 +186,12 @@ final class AppModel: ObservableObject {
                     guard !Task.isCancelled, activeSearchID == searchID else { return }
                 }
                 results = response.hits
+                if let selectedHitPath,
+                   response.hits.contains(where: { $0.path == selectedHitPath }) {
+                    self.selectedHitPath = selectedHitPath
+                } else {
+                    selectedHitPath = response.hits.first?.path
+                }
                 effectiveMode = response.effectiveMode
                 history = try await engine.history(limit: 100)
             } catch {

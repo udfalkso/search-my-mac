@@ -23,7 +23,7 @@ struct SearchMyMacApplication: App {
                 Button("Focus Search") {
                     NotificationCenter.default.post(name: .focusSearchMyMacField, object: nil)
                 }
-                .keyboardShortcut("f", modifiers: [.command, .option])
+                .keyboardShortcut("f", modifiers: [.command])
             }
         }
 
