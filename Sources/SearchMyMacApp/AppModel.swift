@@ -52,6 +52,7 @@ final class AppModel: ObservableObject {
     private var progressTask: Task<Void, Never>?
     private var reconciliationTask: Task<Void, Never>?
     private var semanticProgressTask: Task<Void, Never>?
+    private var enhancementDownloadTask: Task<Void, Never>?
     private var cancellables: Set<AnyCancellable> = []
     private var indexingWorkActive = false
     private var indexOperationID: UUID?
@@ -131,6 +132,8 @@ final class AppModel: ObservableObject {
         progressTask = nil
         reconciliationTask = nil
         semanticProgressTask = nil
+        enhancementDownloadTask?.cancel()
+        enhancementDownloadTask = nil
         await engine?.shutdown()
     }
 
@@ -485,6 +488,31 @@ final class AppModel: ObservableObject {
                 mode = .hybrid
                 scheduleSearch()
             }
+            catch { errorMessage = error.localizedDescription }
+            semanticStatus = await engine.semanticStatus()
+        }
+    }
+
+    func installEnhancedUnderstanding() {
+        guard let engine else { return }
+        enhancementDownloadTask?.cancel()
+        enhancementDownloadTask = Task {
+            do { try await engine.installEnhancedUnderstanding() }
+            catch is CancellationError { }
+            catch { errorMessage = error.localizedDescription }
+            semanticStatus = await engine.semanticStatus()
+        }
+    }
+
+    func cancelEnhancedUnderstandingDownload() {
+        enhancementDownloadTask?.cancel()
+        enhancementDownloadTask = nil
+    }
+
+    func removeEnhancedUnderstanding() {
+        guard let engine else { return }
+        Task {
+            do { try await engine.removeEnhancedUnderstanding() }
             catch { errorMessage = error.localizedDescription }
             semanticStatus = await engine.semanticStatus()
         }

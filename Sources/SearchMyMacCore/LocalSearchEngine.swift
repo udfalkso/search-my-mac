@@ -6,6 +6,7 @@ public actor LocalSearchEngine: SearchEngine {
     private let storageURL: URL
     private let semanticModels: SemanticModelManager
     private let semanticVectors: SemanticVectorIndex
+    private let documentVectors: SemanticVectorIndex
     private let lexicalEngine: TantivyEngineBridge?
     private let isReadOnly: Bool
     private let workGate = IndexingWorkGate()
@@ -17,7 +18,9 @@ public actor LocalSearchEngine: SearchEngine {
     private var queuedChanges: [String: [FileSystemChange]] = [:]
     private var activeSecurityScopes: [String: URL] = [:]
     private var embeddingModel: QwenEmbeddingModel?
+    private var enhancedEmbeddingModel: QwenEmbeddingModel?
     private var semanticTask: Task<Void, Never>?
+    private var documentTask: Task<Void, Never>?
     private var lexicalSyncTask: Task<Void, Never>?
     private var semanticState = SemanticStatus()
     private var semanticPaused = false
@@ -47,6 +50,12 @@ public actor LocalSearchEngine: SearchEngine {
             dimensions: SemanticModelDescriptor.qwen3.dimensions,
             readOnly: readOnly
         )
+        documentVectors = try SemanticVectorIndex(
+            directory: baseURL.appendingPathComponent("SemanticDocuments", isDirectory: true),
+            modelID: SemanticModelDescriptor.enhancedUnderstanding.id,
+            dimensions: SemanticModelDescriptor.enhancedUnderstanding.dimensions,
+            readOnly: readOnly
+        )
         lexicalEngine = readOnly
             ? nil
             : TantivyEngineBridge(indexURL: baseURL.appendingPathComponent("Tantivy-v3", isDirectory: true))
@@ -65,9 +74,30 @@ public actor LocalSearchEngine: SearchEngine {
         // still have a chance to surface after that quality filter.
         let candidateLimit = request.filters == SearchFilters() ? 500 : 1_000
         let vectorMatches = try await semanticVectors.search(query: queryVector, limit: candidateLimit)
-        let semantic = try await removingExcludedHits(
+        let passageSemantic = try await removingExcludedHits(
             from: store.semanticSearchResponse(matches: vectorMatches, request: request)
         )
+        let semantic: SearchResponse
+        let enhancedInstalled = (try? await semanticModels.installedModelURL(for: .enhancedUnderstanding)) != nil
+        semanticState.enhancedUnderstandingInstalled = enhancedInstalled
+        if enhancedInstalled, let enhancedEmbeddingModel {
+            let enhancedQueryVector = try await Task.detached(priority: .userInitiated) {
+                try enhancedEmbeddingModel.embedQuery(query)
+            }.value
+            let documentMatches = try await documentVectors.search(query: enhancedQueryVector, limit: candidateLimit)
+            let documents = try await removingExcludedHits(
+                from: store.semanticDocumentSearchResponse(matches: documentMatches, request: request)
+            )
+            // Two semantic evidence lanes use equal RRF before Hybrid applies
+            // its user-controlled lexical/semantic balance.
+            let fused = Self.hybridResponse(
+                request: SearchRequest(query: request.query, mode: .hybrid, filters: request.filters, hybridSemanticWeight: 0.5, limit: request.limit),
+                lexical: passageSemantic, semantic: documents
+            )
+            semantic = SearchResponse(requestID: request.id, generation: fused.generation, hits: fused.hits, nextCursor: fused.nextCursor, effectiveMode: .semantic)
+        } else {
+            semantic = passageSemantic
+        }
         if request.mode == .semantic {
             try await store.recordSearch(query: request.query, mode: .semantic)
             return semantic
@@ -78,6 +108,12 @@ public actor LocalSearchEngine: SearchEngine {
     }
 
     public func semanticStatus() async -> SemanticStatus {
+        semanticState.enhancedUnderstandingInstalled =
+            (try? await semanticModels.installedModelURL(for: .enhancedUnderstanding)) != nil
+        if let counts = try? await store.semanticDocumentCounts(modelID: SemanticModelDescriptor.enhancedUnderstanding.id) {
+            semanticState.understoodDocuments = counts.ready
+            semanticState.totalUnderstandingDocuments = counts.total
+        }
         if let counts = try? await store.semanticCounts(modelID: SemanticModelDescriptor.qwen3.id) {
             semanticState.embeddedPassages = counts.embedded
             semanticState.totalPassages = counts.total
@@ -118,23 +154,56 @@ public actor LocalSearchEngine: SearchEngine {
         let estimatedVectorsAndRebuild = Int64(counts.total) * Int64(SemanticModelDescriptor.qwen3.dimensions) * 5
         try checkDiskSpace(
             at: storageURL,
-            estimatedAdditional: SemanticModelDescriptor.qwen3.expectedBytes + estimatedVectorsAndRebuild
+            estimatedAdditional: SemanticModelDescriptor.semanticSearch.expectedBytes + estimatedVectorsAndRebuild
         )
         semanticState.phase = .downloading
-        semanticState.currentActivity = "Downloading the verified 639 MB model…"
+        semanticState.currentActivity = "Downloading the verified 639 MB semantic model…"
         semanticState.error = nil
         do {
-            let url = try await semanticModels.download { [weak self] fraction in
+            let url = try await semanticModels.download(.semanticSearch) { [weak self] fraction in
                 Task { await self?.recordSemanticDownloadProgress(fraction) }
             }
             try await loadSemanticModel(at: url)
             startSemanticWorker()
+            startDocumentWorker()
         } catch {
             semanticState.phase = .failed
             semanticState.error = error.localizedDescription
             semanticState.currentActivity = nil
             throw error
         }
+    }
+
+    /// Downloads only the optional local generator. Core passage-vector search
+    /// is deliberately untouched: a failed or removed enhancement never makes
+    /// semantic results unavailable.
+    public func installEnhancedUnderstanding() async throws {
+        try checkDiskSpace(at: storageURL, estimatedAdditional: SemanticModelDescriptor.enhancedUnderstanding.expectedBytes)
+        semanticState.enhancedUnderstandingDownloadFraction = 0
+        semanticState.error = nil
+        do {
+            _ = try await semanticModels.download(.enhancedUnderstanding) { [weak self] fraction in
+                Task { await self?.recordEnhancedDownloadProgress(fraction) }
+            }
+            semanticState.enhancedUnderstandingInstalled = true
+            semanticState.enhancedUnderstandingDownloadFraction = nil
+            startDocumentWorker()
+        } catch {
+            semanticState.enhancedUnderstandingDownloadFraction = nil
+            throw error
+        }
+    }
+
+    public func removeEnhancedUnderstanding() async throws {
+        documentTask?.cancel()
+        documentTask = nil
+        enhancedEmbeddingModel?.shutdown()
+        enhancedEmbeddingModel = nil
+        try await documentVectors.clear()
+        try await semanticModels.remove(.enhancedUnderstanding)
+        semanticState.enhancedUnderstandingInstalled = false
+        semanticState.enhancedUnderstandingDownloadFraction = nil
+        semanticState.understoodDocuments = 0
     }
 
     public func pauseSemanticIndexing() async {
@@ -155,6 +224,7 @@ public actor LocalSearchEngine: SearchEngine {
         semanticState.phase = .indexing
         semanticState.error = nil
         startSemanticWorker()
+        startDocumentWorker()
     }
 
     public func removeSemanticModel() async throws {
@@ -361,12 +431,18 @@ public actor LocalSearchEngine: SearchEngine {
         activeSemanticTask?.cancel()
         await activeSemanticTask?.value
         semanticTask = nil
+        let activeDocumentTask = documentTask
+        activeDocumentTask?.cancel()
+        await activeDocumentTask?.value
+        documentTask = nil
         let activeLexicalTask = lexicalSyncTask
         activeLexicalTask?.cancel()
         await activeLexicalTask?.value
         lexicalSyncTask = nil
         embeddingModel?.shutdown()
         embeddingModel = nil
+        enhancedEmbeddingModel?.shutdown()
+        enhancedEmbeddingModel = nil
         await stopMonitoring()
         if !isReadOnly { try? await store.checkpointForShutdown() }
     }
@@ -422,10 +498,56 @@ public actor LocalSearchEngine: SearchEngine {
         semanticState.downloadFraction = fraction
     }
 
+    private func recordEnhancedDownloadProgress(_ fraction: Double) {
+        guard semanticState.enhancedUnderstandingDownloadFraction != nil else { return }
+        semanticState.enhancedUnderstandingDownloadFraction = fraction
+    }
+
     private func startSemanticWorker() {
         guard embeddingModel != nil, !semanticPaused, semanticTask == nil else { return }
         semanticTask = Task(priority: .utility) { [weak self] in
             await self?.runSemanticWorker()
+        }
+    }
+
+    private func startDocumentWorker() {
+        guard !isReadOnly, documentTask == nil, !semanticPaused else { return }
+        documentTask = Task(priority: .utility) { [weak self] in await self?.runDocumentWorker() }
+    }
+
+    private func runDocumentWorker() async {
+        defer { documentTask = nil }
+        do {
+            guard let modelURL = try await semanticModels.installedModelURL(for: .enhancedUnderstanding) else { return }
+            let model = try await Task.detached(priority: .utility) {
+                try QwenEmbeddingModel(
+                    url: modelURL,
+                    dimensions: SemanticModelDescriptor.enhancedUnderstanding.dimensions
+                )
+            }.value
+            enhancedEmbeddingModel = model
+            defer { model.shutdown(); enhancedEmbeddingModel = nil }
+            while !Task.isCancelled && !semanticPaused {
+                let records = try await store.nextSemanticDocuments(modelID: SemanticModelDescriptor.enhancedUnderstanding.id, limit: 1)
+                guard let record = records.first else {
+                    try await documentVectors.rebuildIfNeeded(force: true)
+                    return
+                }
+                let card = SemanticModelDescriptor.documentInput(filename: record.filename, passage: record.text)
+                let vector = try await Task.detached(priority: .utility) {
+                    try model.embedDocument(card)
+                }.value
+                try await documentVectors.append(key: record.key, vector: vector)
+                try await store.markSemanticDocument(sourceID: record.sourceID, card: card, modelID: SemanticModelDescriptor.enhancedUnderstanding.id)
+                semanticState.understoodDocuments += 1
+                try await documentVectors.rebuildIfNeeded()
+                try await Task.sleep(for: .milliseconds(150))
+            }
+        } catch is CancellationError {
+        } catch {
+            // The optional worker must be self-contained. Keep core semantic
+            // search responsive and expose the problem only in its coverage UI.
+            semanticState.error = "Enhanced understanding: \(error.localizedDescription)"
         }
     }
 

@@ -26,6 +26,14 @@ public struct SemanticStatus: Codable, Equatable, Sendable {
     public var totalPassages: Int
     public var currentActivity: String?
     public var error: String?
+    /// The optional document-understanding model is intentionally tracked
+    /// separately from core semantic readiness. Its absence must never make
+    /// Semantic or Hybrid search fall back to text-only behavior.
+    public var enhancedUnderstandingInstalled: Bool
+    public var enhancedUnderstandingBytes: Int64
+    public var understoodDocuments: Int
+    public var totalUnderstandingDocuments: Int
+    public var enhancedUnderstandingDownloadFraction: Double?
 
     public init(
         phase: SemanticPhase = .notInstalled,
@@ -36,7 +44,12 @@ public struct SemanticStatus: Codable, Equatable, Sendable {
         embeddedPassages: Int = 0,
         totalPassages: Int = 0,
         currentActivity: String? = nil,
-        error: String? = nil
+        error: String? = nil,
+        enhancedUnderstandingInstalled: Bool = false,
+        enhancedUnderstandingBytes: Int64 = 2_496_703_776,
+        understoodDocuments: Int = 0,
+        totalUnderstandingDocuments: Int = 0,
+        enhancedUnderstandingDownloadFraction: Double? = nil
     ) {
         self.phase = phase
         self.modelID = modelID
@@ -47,6 +60,11 @@ public struct SemanticStatus: Codable, Equatable, Sendable {
         self.totalPassages = totalPassages
         self.currentActivity = currentActivity
         self.error = error
+        self.enhancedUnderstandingInstalled = enhancedUnderstandingInstalled
+        self.enhancedUnderstandingBytes = enhancedUnderstandingBytes
+        self.understoodDocuments = understoodDocuments
+        self.totalUnderstandingDocuments = totalUnderstandingDocuments
+        self.enhancedUnderstandingDownloadFraction = enhancedUnderstandingDownloadFraction
     }
 
     public var isSearchReady: Bool {
@@ -403,6 +421,8 @@ public struct IndexHealth: Codable, Equatable, Sendable {
     public var databaseBytes: Int64
     public var lexicalIndexBytes: Int64
     public var semanticModelBytes: Int64
+    public var embeddingModelBytes: Int64
+    public var enhancedModelBytes: Int64
     public var semanticIndexBytes: Int64
     public var workingStorageBytes: Int64
     public var generation: Int64
@@ -424,6 +444,8 @@ public struct IndexHealth: Codable, Equatable, Sendable {
         databaseBytes: Int64 = 0,
         lexicalIndexBytes: Int64 = 0,
         semanticModelBytes: Int64 = 0,
+        embeddingModelBytes: Int64 = 0,
+        enhancedModelBytes: Int64 = 0,
         semanticIndexBytes: Int64 = 0,
         workingStorageBytes: Int64 = 0,
         generation: Int64 = 0
@@ -436,6 +458,8 @@ public struct IndexHealth: Codable, Equatable, Sendable {
         self.databaseBytes = databaseBytes
         self.lexicalIndexBytes = lexicalIndexBytes
         self.semanticModelBytes = semanticModelBytes
+        self.embeddingModelBytes = embeddingModelBytes
+        self.enhancedModelBytes = enhancedModelBytes
         self.semanticIndexBytes = semanticIndexBytes
         self.workingStorageBytes = workingStorageBytes
         self.generation = generation

@@ -147,13 +147,14 @@ private struct IndexHealthView: View {
                 }
                 HStack(spacing: 18) {
                     StorageBreakdownItem(title: "Text search data", bytes: model.health.lexicalIndexBytes)
-                    StorageBreakdownItem(title: "Qwen model", bytes: model.health.semanticModelBytes)
+                    StorageBreakdownItem(title: "Embedding model", bytes: model.health.embeddingModelBytes)
+                    StorageBreakdownItem(title: "Enhanced model", bytes: model.health.enhancedModelBytes)
                     StorageBreakdownItem(title: "Semantic search data", bytes: model.health.semanticIndexBytes)
                     StorageBreakdownItem(title: "Indexing workspace (est.)", bytes: model.health.workingStorageBytes)
                     Spacer()
                 }
                 .padding(.horizontal, 4)
-                Text("Text search includes filenames and extracted document text. Semantic search includes the local Qwen model and the data it creates. Temporary indexing space is released as work completes.")
+                Text("Text search includes filenames and extracted document text. Semantic storage is split between the core embedding model, optional enhanced understanding model, and their local search data. Temporary indexing space is released as work completes.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack(spacing: 12) {
@@ -1526,7 +1527,10 @@ private struct IndexStatusBar: View {
 
     var body: some View {
         Divider()
-        VStack(spacing: showsDetailRow ? 5 : 0) {
+        // Keep a two-line footprint from the first paint. The detail itself
+        // fades rather than being inserted/removed, so startup state changes
+        // cannot make the window's bottom edge jump.
+        VStack(spacing: 5) {
             HStack(spacing: 9) {
                 if showsActivityIndicator {
                     ProgressView()
@@ -1549,23 +1553,26 @@ private struct IndexStatusBar: View {
                     .foregroundStyle(.secondary)
             }
 
-            if showsDetailRow {
-                HStack(spacing: 9) {
-                    Text(detailText)
+            HStack(spacing: 9) {
+                Text(detailText)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                if model.indexingRate >= 0.5 && isActivelyWorking {
+                    Text("\(model.indexingRate.formatted(.number.precision(.fractionLength(0)))) files/sec")
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    Spacer(minLength: 8)
-                    if model.indexingRate >= 0.5 && isActivelyWorking {
-                        Text("\(model.indexingRate.formatted(.number.precision(.fractionLength(0)))) files/sec")
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
                 }
             }
+            .frame(height: 13)
+            .opacity(detailIsVisible ? 1 : 0)
+            .accessibilityHidden(!detailIsVisible)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
+        .frame(height: 52)
+        .animation(.easeInOut(duration: 0.18), value: detailIsVisible)
     }
 
     private var isActivelyWorking: Bool {
@@ -1579,8 +1586,8 @@ private struct IndexStatusBar: View {
         !model.hasLoadedInitialState || isActivelyWorking
     }
 
-    private var showsDetailRow: Bool {
-        model.hasLoadedInitialState && model.progress.phase != .idle
+    private var detailIsVisible: Bool {
+        !model.hasLoadedInitialState || model.progress.phase != .idle
     }
 
     private var statusText: String {

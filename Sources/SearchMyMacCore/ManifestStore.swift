@@ -7,6 +7,14 @@ struct SemanticPassageRecord: Sendable {
     let filename: String
 }
 
+struct SemanticDocumentRecord: Sendable {
+    let key: UInt64
+    let sourceID: String
+    let filename: String
+    let path: String
+    let text: String
+}
+
 struct ExclusionPurgeBatch: Sendable {
     let lastRowID: Int64
     let examined: Int
@@ -375,6 +383,10 @@ actor ManifestStore {
 
     func upsert(file: DiscoveredFile, document: ExtractedDocument?) throws {
         try database.transaction {
+            // A changed source invalidates its generated card before new
+            // passages are visible. The document-vector worker will recreate it
+            // from the fresh source generation.
+            try database.execute("DELETE FROM semantic_documents WHERE source_id = ?", bindings: [.text(file.sourceID)])
             try deletePassages(sourceID: file.sourceID)
             let nextGeneration = try generation() + 1
             let availability = document?.availability ?? file.availability
@@ -720,6 +732,60 @@ actor ManifestStore {
         try database.execute("DELETE FROM semantic_tombstones")
     }
 
+    func nextSemanticDocuments(modelID: String, limit: Int) throws -> [SemanticDocumentRecord] {
+        let rows = try database.query(
+            """
+            SELECT f.source_id, f.filename, f.path,
+                   GROUP_CONCAT(p.body, '\n') AS body
+            FROM files f
+            JOIN passages p ON p.source_id = f.source_id
+            LEFT JOIN semantic_documents d ON d.source_id = f.source_id AND d.embedding_model = ?
+            WHERE d.source_id IS NULL AND length(trim(p.body)) > 0
+            GROUP BY f.source_id
+            ORDER BY COALESCE(f.modified_at, 0) DESC, f.source_id
+            LIMIT ?
+            """,
+            bindings: [.text(modelID), .integer(Int64(max(1, limit)))]
+        )
+        return rows.compactMap { row in
+            guard let sourceID = row["source_id"]?.string,
+                  let filename = row["filename"]?.string,
+                  let path = row["path"]?.string,
+                  let body = row["body"]?.string else { return nil }
+            return SemanticDocumentRecord(
+                key: Self.semanticDocumentKey(sourceID), sourceID: sourceID,
+                filename: filename, path: path, text: String(body.prefix(18_000))
+            )
+        }
+    }
+
+    func markSemanticDocument(
+        sourceID: String, card: String, modelID: String
+    ) throws {
+        try database.execute(
+            """
+            INSERT INTO semantic_documents(source_id, card, embedding_model, generated_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(source_id) DO UPDATE SET
+                card = excluded.card, embedding_model = excluded.embedding_model, generated_at = excluded.generated_at
+            """,
+            bindings: [.text(sourceID), .text(card), .text(modelID), .real(Date.now.timeIntervalSince1970)]
+        )
+    }
+
+    func semanticDocumentCounts(modelID: String) throws -> (ready: Int, total: Int) {
+        let row = try database.query(
+            """
+            SELECT COUNT(DISTINCT f.source_id) AS total,
+                   COUNT(DISTINCT CASE WHEN d.embedding_model = ? THEN d.source_id END) AS ready
+            FROM files f JOIN passages p ON p.source_id = f.source_id
+            LEFT JOIN semantic_documents d ON d.source_id = f.source_id
+            WHERE length(trim(p.body)) > 0
+            """, bindings: [.text(modelID)]
+        ).first ?? [:]
+        return (Int(row["ready"]?.int64 ?? 0), Int(row["total"]?.int64 ?? 0))
+    }
+
     func recordSearch(query: String, mode: SearchMode) throws {
         guard historyRecordingEnabled else { return }
         try recordHistory(SearchHistoryEntry(query: query, mode: mode))
@@ -789,6 +855,51 @@ actor ManifestStore {
         return SearchResponse(requestID: request.id, generation: currentGeneration, hits: Array(hits), effectiveMode: .semantic)
     }
 
+    /// Materializes document-card candidates using source text for snippets.
+    /// Generated cards are ranking evidence only and never shown as quotations.
+    func semanticDocumentSearchResponse(matches: [VectorMatch], request: SearchRequest) throws -> SearchResponse {
+        let generation = try generation()
+        guard !matches.isEmpty else {
+            return SearchResponse(requestID: request.id, generation: generation, hits: [], effectiveMode: .semantic)
+        }
+        let scores = Dictionary(uniqueKeysWithValues: matches.map { ($0.key, Double($0.score)) })
+        let rows = try database.query(
+            """
+            SELECT d.source_id, f.path, f.filename, f.extension, f.modified_at, f.availability,
+                   p.id AS passage_id, p.body, p.location_kind, p.location_label
+            FROM semantic_documents d
+            JOIN files f ON f.source_id = d.source_id
+            JOIN passages p ON p.source_id = d.source_id
+            WHERE d.embedding_model = ?
+            GROUP BY d.source_id
+            """, bindings: [.text(SemanticModelDescriptor.enhancedUnderstanding.id)]
+        )
+        let terms = parser.highlightTerms(request.query)
+        let hits = rows.compactMap { row -> SearchHit? in
+            guard let sourceID = row["source_id"]?.string,
+                  let score = scores[Self.semanticDocumentKey(sourceID)],
+                  let path = row["path"]?.string,
+                  let filename = row["filename"]?.string else { return nil }
+            let body = row["body"]?.string ?? ""
+            let excerpt = Self.semanticExcerpt(body)
+            return SearchHit(
+                id: sourceID, url: URL(fileURLWithPath: path), filename: filename, path: path,
+                fileExtension: row["extension"]?.string ?? "",
+                modifiedAt: row["modified_at"]?.double.map(Date.init(timeIntervalSince1970:)),
+                availability: ContentAvailability(rawValue: row["availability"]?.string ?? "") ?? .filenameOnly,
+                score: score,
+                snippets: [SearchSnippet(
+                    id: "topic-\(sourceID)", text: excerpt,
+                    highlights: highlightRanges(in: excerpt, terms: terms),
+                    locationKind: StructuralLocationKind(rawValue: row["location_kind"]?.string ?? "") ?? .unknown,
+                    locationLabel: row["location_label"]?.string,
+                    score: score
+                )]
+            )
+        }.sorted { $0.score > $1.score }.prefix(request.limit)
+        return SearchResponse(requestID: request.id, generation: generation, hits: Array(hits), effectiveMode: .semantic)
+    }
+
     private static func shouldIncludeImageSemanticResults(for filters: SearchFilters) -> Bool {
         let requestedExtensions = Set(filters.extensions.map { $0.lowercased() })
         return !requestedExtensions.isDisjoint(with: DocumentExtractor.imageExtensions)
@@ -848,6 +959,9 @@ actor ManifestStore {
             whoseNameHasPrefix: databaseURL.lastPathComponent
         )
         let modelBytes = storageBytes(in: storageDirectory.appendingPathComponent("Models", isDirectory: true))
+        let modelsDirectory = storageDirectory.appendingPathComponent("Models", isDirectory: true)
+        let embeddingModelBytes = storageBytes(at: modelsDirectory.appendingPathComponent(SemanticModelDescriptor.semanticSearch.filename))
+        let enhancedModelBytes = storageBytes(at: modelsDirectory.appendingPathComponent(SemanticModelDescriptor.enhancedUnderstanding.filename))
         let semanticBytes = storageBytes(in: storageDirectory.appendingPathComponent("Semantic", isDirectory: true))
         let tantivyBytes = storageBytes(in: storageDirectory.appendingPathComponent("Tantivy-v3", isDirectory: true))
         // Staging rows and their indexes average roughly 420 allocated bytes in
@@ -867,6 +981,8 @@ actor ManifestStore {
             databaseBytes: totalBytes,
             lexicalIndexBytes: lexicalBytes,
             semanticModelBytes: modelBytes,
+            embeddingModelBytes: embeddingModelBytes,
+            enhancedModelBytes: enhancedModelBytes,
             semanticIndexBytes: semanticBytes,
             workingStorageBytes: workingBytes,
             generation: try generation()
@@ -1149,6 +1265,17 @@ actor ManifestStore {
         )
         try database.execute(
             """
+            CREATE TABLE IF NOT EXISTS semantic_documents(
+                source_id TEXT PRIMARY KEY REFERENCES files(source_id) ON DELETE CASCADE,
+                card TEXT NOT NULL,
+                embedding_model TEXT NOT NULL,
+                generated_at REAL NOT NULL
+            )
+            """
+        )
+        try database.execute("CREATE INDEX IF NOT EXISTS semantic_documents_model_idx ON semantic_documents(embedding_model)")
+        try database.execute(
+            """
             CREATE TABLE IF NOT EXISTS lexical_operations(
                 source_id TEXT PRIMARY KEY,
                 generation INTEGER NOT NULL,
@@ -1282,6 +1409,13 @@ actor ManifestStore {
             }
         }
         try database.execute("DELETE FROM passages WHERE source_id = ?", bindings: [.text(sourceID)])
+    }
+
+    private static func semanticDocumentKey(_ sourceID: String) -> UInt64 {
+        // Stable FNV-1a key in a disjoint range from SQLite passage rowids.
+        var value: UInt64 = 14_695_981_039_346_656_037
+        for byte in sourceID.utf8 { value = (value ^ UInt64(byte)) &* 1_099_511_628_211 }
+        return value | (UInt64(1) << 63)
     }
 
     private func recordHistory(_ entry: SearchHistoryEntry) throws {
@@ -1502,6 +1636,11 @@ actor ManifestStore {
             total += Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? values.fileSize ?? 0)
         }
         return total
+    }
+
+    private func storageBytes(at url: URL) -> Int64 {
+        (try? url.resourceValues(forKeys: [.fileAllocatedSizeKey, .fileSizeKey]))
+            .flatMap { values in values.fileAllocatedSize.map(Int64.init) ?? values.fileSize.map(Int64.init) } ?? 0
     }
 
     private func storageBytesForFiles(in directory: URL, whoseNameHasPrefix prefix: String) -> Int64 {

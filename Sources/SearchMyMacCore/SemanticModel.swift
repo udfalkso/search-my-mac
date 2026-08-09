@@ -6,9 +6,11 @@ struct SemanticModelDescriptor: Sendable {
     /// Bump when the text sent to the embedding model changes. Existing vectors
     /// then need a semantic-only rebuild; the lexical index and source files are
     /// unaffected.
-    static let embeddingFormatVersion = 3
+    static let embeddingFormatVersion = 4
 
-    static let qwen3 = SemanticModelDescriptor(
+    /// The compact, capable baseline required for meaning-based search.
+    /// It keeps Semantic Search practical for every user.
+    static let semanticSearch = SemanticModelDescriptor(
         id: "qwen3-embedding-0.6b-q8",
         displayName: "Qwen3 Embedding 0.6B",
         filename: "Qwen3-Embedding-0.6B-Q8_0.gguf",
@@ -17,6 +19,22 @@ struct SemanticModelDescriptor: Sendable {
         sha256: "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439",
         dimensions: 1_024
     )
+
+    /// The optional higher-capacity model. It powers a separate document-level
+    /// semantic lane and never gates the core 0.6B passage search.
+    static let enhancedUnderstanding = SemanticModelDescriptor(
+        id: "qwen3-embedding-4b-q4-k-m",
+        displayName: "Qwen3 Embedding 4B",
+        filename: "Qwen3-Embedding-4B-Q4_K_M.gguf",
+        downloadURL: URL(string: "https://huggingface.co/Qwen/Qwen3-Embedding-4B-GGUF/resolve/main/Qwen3-Embedding-4B-Q4_K_M.gguf")!,
+        expectedBytes: 2_496_703_776,
+        sha256: "2b0cf8f17b4c723c27303015383c27ec4bf2d8314bb677d05e920dd70bb0f16b",
+        dimensions: 1_024
+    )
+
+    /// Compatibility shorthand for the core semantic component. New code
+    /// should use `semanticSearch` to make its role clear.
+    static let qwen3 = semanticSearch
 
     let id: String
     let displayName: String
@@ -46,7 +64,6 @@ struct SemanticModelDescriptor: Sendable {
 }
 
 actor SemanticModelManager {
-    let descriptor = SemanticModelDescriptor.qwen3
     private let directory: URL
     private let isReadOnly: Bool
 
@@ -62,10 +79,15 @@ actor SemanticModelManager {
         }
     }
 
-    var modelURL: URL { directory.appendingPathComponent(descriptor.filename) }
+    func modelURL(for descriptor: SemanticModelDescriptor) -> URL {
+        directory.appendingPathComponent(descriptor.filename)
+    }
 
-    func installedModelURL(validateChecksum: Bool = false) throws -> URL? {
-        let url = modelURL
+    func installedModelURL(
+        for descriptor: SemanticModelDescriptor = .semanticSearch,
+        validateChecksum: Bool = false
+    ) throws -> URL? {
+        let url = modelURL(for: descriptor)
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         let size = ((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init)) ?? -1
         guard size == descriptor.expectedBytes else { return nil }
@@ -73,9 +95,12 @@ actor SemanticModelManager {
         return url
     }
 
-    func download(progress: @escaping @Sendable (Double) -> Void = { _ in }) async throws -> URL {
+    func download(
+        _ descriptor: SemanticModelDescriptor = .semanticSearch,
+        progress: @escaping @Sendable (Double) -> Void = { _ in }
+    ) async throws -> URL {
         guard !isReadOnly else { throw SearchMyMacError.semantic("The model store was opened read-only.") }
-        if let existing = try installedModelURL(validateChecksum: true) { return existing }
+        if let existing = try installedModelURL(for: descriptor, validateChecksum: true) { return existing }
         let bridge = ModelDownloadBridge(url: descriptor.downloadURL, progress: progress)
         let (temporaryDownload, response) = try await bridge.download()
         defer { try? FileManager.default.removeItem(at: temporaryDownload) }
@@ -90,6 +115,7 @@ actor SemanticModelManager {
             throw SearchMyMacError.semantic("The downloaded model failed its SHA-256 integrity check.")
         }
 
+        let modelURL = modelURL(for: descriptor)
         let staging = directory.appendingPathComponent(descriptor.filename + ".download")
         try? FileManager.default.removeItem(at: staging)
         try FileManager.default.moveItem(at: temporaryDownload, to: staging)
@@ -102,8 +128,9 @@ actor SemanticModelManager {
         return modelURL
     }
 
-    func remove() throws {
+    func remove(_ descriptor: SemanticModelDescriptor = .semanticSearch) throws {
         guard !isReadOnly else { throw SearchMyMacError.semantic("The model store was opened read-only.") }
+        let modelURL = modelURL(for: descriptor)
         if FileManager.default.fileExists(atPath: modelURL.path) {
             try FileManager.default.removeItem(at: modelURL)
         }

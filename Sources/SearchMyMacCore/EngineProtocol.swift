@@ -21,6 +21,8 @@ public protocol SearchEngine: Sendable {
     func setHistoryRecording(_ enabled: Bool) async
     func semanticStatus() async -> SemanticStatus
     func installSemanticModel() async throws
+    func installEnhancedUnderstanding() async throws
+    func removeEnhancedUnderstanding() async throws
     func pauseSemanticIndexing() async
     func resumeSemanticIndexing() async throws
     func removeSemanticModel() async throws

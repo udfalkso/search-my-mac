@@ -133,7 +133,7 @@ struct SettingsView: View {
 
     private var privacySettings: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 26) {
+            VStack(alignment: .leading, spacing: 16) {
                 settingsHeader(
                     title: "Privacy",
                     subtitle: "Control what Search My Mac remembers",
@@ -240,6 +240,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 28) {
                 semanticHeader
                 semanticDetails
+                enhancedUnderstandingSettings
                 hybridBalanceSettings
                 semanticExplanation
                 semanticActions
@@ -268,12 +269,22 @@ struct SettingsView: View {
 
             Spacer(minLength: 20)
 
-            Label(semanticStatusText, systemImage: semanticStatusIcon)
-                .font(.callout.weight(.medium))
-                .foregroundStyle(semanticStatusColor)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                .background(semanticStatusColor.opacity(0.12), in: Capsule())
+            VStack(alignment: .trailing, spacing: 9) {
+                Label(semanticStatusText, systemImage: semanticStatusIcon)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(semanticStatusColor)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(semanticStatusColor.opacity(0.12), in: Capsule())
+
+                if model.semanticStatus.phase == .notInstalled || model.semanticStatus.phase == .failed {
+                    Button("Download (\(coreDownloadSize))") { model.installSemanticModel() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.regular)
+                        .help("Download the \(coreDownloadSize) Semantic Search model")
+                        .accessibilityLabel("Download Semantic Search, \(coreDownloadSize)")
+                }
+            }
         }
     }
 
@@ -340,6 +351,69 @@ struct SettingsView: View {
         }
     }
 
+    /// A separate, quiet configuration section makes it clear that this is an
+    /// enhancement—not a prerequisite or an alarming second setup step.
+    private var enhancedUnderstandingSettings: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "sparkles")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 30, height: 30)
+                    .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Enhanced document understanding")
+                        .font(.headline)
+                    Text("Optional. Semantic search works normally without it. When available, it adds broader topic and life-event understanding to your local index.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 8)
+            }
+
+            HStack {
+                Label(
+                    model.semanticStatus.enhancedUnderstandingInstalled ? "Installed" : "Not installed",
+                    systemImage: model.semanticStatus.enhancedUnderstandingInstalled ? "checkmark.circle.fill" : "arrow.down.circle"
+                )
+                .font(.callout.weight(.medium))
+                .foregroundStyle(model.semanticStatus.enhancedUnderstandingInstalled ? .green : .secondary)
+
+                Text(ByteCountFormatter.string(
+                    fromByteCount: model.semanticStatus.enhancedUnderstandingBytes,
+                    countStyle: .file
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Spacer()
+
+                if let fraction = model.semanticStatus.enhancedUnderstandingDownloadFraction {
+                    ProgressView(value: fraction)
+                        .frame(width: 100)
+                    Text(fraction.formatted(.percent.precision(.fractionLength(0))))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Button("Cancel", role: .cancel) { model.cancelEnhancedUnderstandingDownload() }
+                } else if model.semanticStatus.enhancedUnderstandingInstalled {
+                    if model.semanticStatus.totalUnderstandingDocuments > 0 {
+                        Text("\(model.semanticStatus.understoodDocuments.formatted()) of \(model.semanticStatus.totalUnderstandingDocuments.formatted()) ready")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Button("Remove", role: .destructive) { model.removeEnhancedUnderstanding() }
+                } else {
+                    Button("Download Enhancement (\(enhancementDownloadSize))") { model.installEnhancedUnderstanding() }
+                        .buttonStyle(.bordered)
+                }
+            }
+        }
+        .padding(20)
+        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
     private var hybridBalanceSettings: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
@@ -380,6 +454,14 @@ struct SettingsView: View {
         .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
+    private var coreDownloadSize: String {
+        ByteCountFormatter.string(fromByteCount: model.semanticStatus.modelBytes, countStyle: .file)
+    }
+
+    private var enhancementDownloadSize: String {
+        ByteCountFormatter.string(fromByteCount: model.semanticStatus.enhancedUnderstandingBytes, countStyle: .file)
+    }
+
     private var hybridBalanceSummary: String {
         let semanticPercent = Int((model.hybridSemanticWeight * 100).rounded())
         return "Text \(100 - semanticPercent)% · Meaning \(semanticPercent)%"
@@ -390,9 +472,7 @@ struct SettingsView: View {
         HStack(spacing: 12) {
             switch model.semanticStatus.phase {
             case .notInstalled, .failed:
-                Button("Download & Enable") { model.installSemanticModel() }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
+                EmptyView()
             case .downloading, .loading:
                 ProgressView().controlSize(.small)
                 Text(model.semanticStatus.phase == .downloading ? "Downloading…" : "Loading…")

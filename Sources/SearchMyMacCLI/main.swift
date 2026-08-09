@@ -120,6 +120,7 @@ private struct CLIEnvelope: Encodable {
     let query: String
     let requestedMode: String
     let effectiveMode: String
+    let enhancedSemantic: Bool
     let resultCount: Int
     let results: [CLIResult]
 
@@ -127,6 +128,7 @@ private struct CLIEnvelope: Encodable {
         case query
         case requestedMode = "requested_mode"
         case effectiveMode = "effective_mode"
+        case enhancedSemantic = "enhanced_semantic"
         case resultCount = "result_count"
         case results
     }
@@ -178,11 +180,13 @@ private struct SearchMyMacCLI {
                 limit: options.limit
             ))
             let results = response.hits.map(makeResult)
+            let semanticStatus = await engine.semanticStatus()
             try writeResults(
                 results,
                 query: options.query,
                 requestedMode: options.mode,
                 effectiveMode: response.effectiveMode,
+                enhancedSemantic: semanticStatus.enhancedUnderstandingInstalled,
                 format: options.output
             )
             await engine.shutdown()
@@ -221,6 +225,7 @@ private struct SearchMyMacCLI {
         query: String,
         requestedMode: SearchMode,
         effectiveMode: SearchMode,
+        enhancedSemantic: Bool,
         format: CLIOutputFormat
     ) throws {
         switch format {
@@ -229,6 +234,7 @@ private struct SearchMyMacCLI {
                 query: query,
                 requestedMode: requestedMode.rawValue,
                 effectiveMode: effectiveMode.rawValue,
+                enhancedSemantic: enhancedSemantic,
                 resultCount: results.count,
                 results: results
             )
