@@ -33,22 +33,6 @@ private enum SearchMyMacTheme {
             : lensBlue.opacity(0.18)
     }
 
-    static func windowWash(for colorScheme: ColorScheme) -> LinearGradient {
-        LinearGradient(
-            colors: colorScheme == .dark
-                ? [
-                    Color(red: 0.105, green: 0.180, blue: 0.230),
-                    Color(red: 0.070, green: 0.125, blue: 0.180)
-                ]
-                : [
-                    Color(red: 0.965, green: 0.977, blue: 1.000),
-                    Color(red: 0.938, green: 0.958, blue: 0.992)
-                ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
-    }
-
     static func sidebarWash(for colorScheme: ColorScheme) -> LinearGradient {
         LinearGradient(
             colors: colorScheme == .dark
@@ -65,11 +49,6 @@ private enum SearchMyMacTheme {
         )
     }
 
-    static func windowBackgroundColor(for colorScheme: ColorScheme) -> NSColor {
-        colorScheme == .dark
-            ? NSColor(red: 0.085, green: 0.150, blue: 0.200, alpha: 1)
-            : NSColor(red: 0.949, green: 0.968, blue: 0.997, alpha: 1)
-    }
 }
 
 struct ContentView: View {
@@ -106,7 +85,7 @@ struct ContentView: View {
                 IndexStatusBar()
             }
             .background {
-                SearchMyMacTheme.windowWash(for: colorScheme)
+                Color(nsColor: .windowBackgroundColor)
                     .ignoresSafeArea()
             }
         }
@@ -138,32 +117,6 @@ struct ContentView: View {
             withAnimation(.easeOut(duration: 0.18)) {
                 sidebarSelection = .settings
             }
-        }
-        .background {
-            WindowTintInstaller(colorScheme: colorScheme)
-                .frame(width: 0, height: 0)
-        }
-    }
-}
-
-private struct WindowTintInstaller: NSViewRepresentable {
-    let colorScheme: ColorScheme
-
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView(frame: .zero)
-        applyTint(to: view)
-        return view
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {
-        applyTint(to: nsView)
-    }
-
-    private func applyTint(to view: NSView) {
-        let backgroundColor = SearchMyMacTheme.windowBackgroundColor(for: colorScheme)
-        DispatchQueue.main.async {
-            view.window?.backgroundColor = backgroundColor
-            view.window?.titlebarAppearsTransparent = true
         }
     }
 }
@@ -1686,7 +1639,6 @@ private struct ResultsView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.colorScheme) private var colorScheme
     @FocusState private var resultsFocused: Bool
-    @State private var showsPreview = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1709,14 +1661,14 @@ private struct ResultsView: View {
                 ShortcutHint(keys: "↩", label: "Open")
                 ShortcutHint(keys: "Space", label: "Quick Look")
                 Button {
-                    withAnimation(.easeOut(duration: 0.2)) { showsPreview.toggle() }
+                    withAnimation(.easeOut(duration: 0.2)) { model.isResultPreviewVisible.toggle() }
                 } label: {
-                    Label(showsPreview ? "Hide Preview" : "Preview", systemImage: "sidebar.trailing")
+                    Label(model.isResultPreviewVisible ? "Hide Preview" : "Preview", systemImage: "sidebar.trailing")
                 }
                 .buttonStyle(.borderless)
                 .controlSize(.small)
                 .disabled(selectedHit == nil)
-                .help(showsPreview ? "Hide the preview pane" : "Show a preview without leaving your search")
+                .help(model.isResultPreviewVisible ? "Hide the preview pane" : "Show a preview without leaving your search")
             }
             .padding(.horizontal, 14)
             .frame(height: 34)
@@ -1774,7 +1726,7 @@ private struct ResultsView: View {
                     }
                 }
 
-                if showsPreview, let selectedHit {
+                if model.isResultPreviewVisible, let selectedHit {
                     ResultPreviewPane(hit: selectedHit)
                         .frame(minWidth: 280, idealWidth: 360, maxWidth: 480)
                         .transition(.move(edge: .trailing).combined(with: .opacity))

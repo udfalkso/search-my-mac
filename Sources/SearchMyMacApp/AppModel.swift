@@ -14,6 +14,9 @@ final class AppModel: ObservableObject {
     }
     @Published var filters = SearchFilters()
     @Published var results: [SearchHit] = []
+    /// Starts open for each application launch, while preserving the user's
+    /// choice as searches and result views update during that session.
+    @Published var isResultPreviewVisible = true
     @Published var effectiveMode: SearchMode = .text
     @Published var roots: [IndexRoot] = []
     @Published var history: [SearchHistoryEntry] = []
