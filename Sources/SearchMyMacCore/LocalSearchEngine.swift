@@ -290,6 +290,7 @@ public actor LocalSearchEngine: SearchEngine {
                 policy: discovery.policy,
                 reconcileDeletions: staged.summary.inaccessibleItemCount == 0
             )
+            try await store.markRootReconciled(rootID: root.id)
             scheduleLexicalSync()
             try await store.setDiscoveryErrorCount(rootID: root.id, count: staged.summary.inaccessibleItemCount)
             progressState = IndexProgress(
@@ -418,6 +419,15 @@ public actor LocalSearchEngine: SearchEngine {
         }
     }
 
+    public func startupReconciliationIsDue(maximumAge: TimeInterval = 86_400) async throws -> Bool {
+        for root in try await store.roots() where root.isEnabled && root.isAvailable {
+            if try await store.reconciliationIsDue(rootID: root.id, maximumAge: maximumAge) {
+                return true
+            }
+        }
+        return false
+    }
+
     public func stopMonitoring() async {
         for monitor in monitors.values { monitor.stop() }
         monitors.removeAll()
@@ -480,9 +490,13 @@ public actor LocalSearchEngine: SearchEngine {
         // semantic search unavailable until this idempotent refresh completes.
         try await store.resetSemanticEmbeddings()
         try await semanticVectors.clear()
+        try await store.resetSemanticDocuments()
+        try await documentVectors.clear()
         try await store.setSemanticEmbeddingFormatVersion(expectedFormat)
         semanticState.embeddedPassages = 0
         semanticState.totalPassages = 0
+        semanticState.understoodDocuments = 0
+        semanticState.totalUnderstandingDocuments = 0
         semanticState.currentActivity = "Refreshing semantic understanding…"
     }
 
@@ -518,6 +532,18 @@ public actor LocalSearchEngine: SearchEngine {
     private func runDocumentWorker() async {
         defer { documentTask = nil }
         do {
+            // The optional 4B model shares the GPU with core passage vectors.
+            // Never let it turn the required semantic index into a multi-day
+            // job; it will begin as soon as the core lane catches up.
+            while !Task.isCancelled && !semanticPaused {
+                let coreCounts = try await store.semanticCounts(modelID: SemanticModelDescriptor.qwen3.id)
+                if coreCounts.total > 0, coreCounts.embedded < coreCounts.total {
+                    try await Task.sleep(for: .seconds(2))
+                    continue
+                }
+                break
+            }
+            guard !Task.isCancelled, !semanticPaused else { return }
             guard let modelURL = try await semanticModels.installedModelURL(for: .enhancedUnderstanding) else { return }
             let model = try await Task.detached(priority: .utility) {
                 try QwenEmbeddingModel(
@@ -528,6 +554,8 @@ public actor LocalSearchEngine: SearchEngine {
             enhancedEmbeddingModel = model
             defer { model.shutdown(); enhancedEmbeddingModel = nil }
             while !Task.isCancelled && !semanticPaused {
+                let coreCounts = try await store.semanticCounts(modelID: SemanticModelDescriptor.qwen3.id)
+                guard coreCounts.total == 0 || coreCounts.embedded >= coreCounts.total else { return }
                 let records = try await store.nextSemanticDocuments(modelID: SemanticModelDescriptor.enhancedUnderstanding.id, limit: 1)
                 guard let record = records.first else {
                     try await documentVectors.rebuildIfNeeded(force: true)
@@ -574,27 +602,36 @@ public actor LocalSearchEngine: SearchEngine {
                     semanticState.totalPassages = counts.total
                     semanticState.phase = .ready
                     semanticState.currentActivity = nil
+                    startDocumentWorker()
                     // Keep the installed worker dormant but alive so passages
                     // extracted later are picked up without an unrelated restart.
                     try await Task.sleep(for: .seconds(2))
                     continue
                 }
-                for passage in passages {
+                for start in stride(from: 0, to: passages.count, by: 2) {
+                    let end = min(start + 2, passages.count)
+                    let passageBatch = Array(passages[start..<end])
+                    let inputs = passageBatch.map {
+                        SemanticModelDescriptor.documentInput(filename: $0.filename, passage: $0.text)
+                    }
+                    let workStartedAt = Date.timeIntervalSinceReferenceDate
+                    let vectors = try await Task.detached(priority: .utility) {
+                        try embeddingModel.embedDocuments(inputs)
+                    }.value
+                    guard vectors.count == passageBatch.count else {
+                        throw SearchMyMacError.semantic("The semantic model returned an incomplete embedding batch.")
+                    }
+                    for (passage, vector) in zip(passageBatch, vectors) {
                     try Task.checkCancellation()
                     if semanticPaused { return }
-                    let workStartedAt = Date.timeIntervalSinceReferenceDate
                     semanticState.phase = .indexing
                     semanticState.currentActivity = passage.filename
-                    let vector = try await Task.detached(priority: .utility) {
-                        try embeddingModel.embedDocument(
-                            SemanticModelDescriptor.documentInput(filename: passage.filename, passage: passage.text)
-                        )
-                    }.value
                     try await semanticVectors.append(key: passage.id, vector: vector)
                     try await store.markPassageEmbedded(id: passage.id, modelID: SemanticModelDescriptor.qwen3.id)
                     semanticState.embeddedPassages += 1
                     if semanticState.embeddedPassages.isMultiple(of: 250) {
                         try checkDiskSpace(at: storageURL)
+                    }
                     }
                     try await throttleBackgroundIndexing(workStartedAt: workStartedAt)
                 }
@@ -1184,8 +1221,8 @@ struct SemanticWorkSchedule: Sendable, Equatable {
         // Amortize queue selection and vector publication across enough passages
         // to remain efficient on large indexes while still yielding frequently
         // when extraction is competing for resources.
-        batchSize = textIndexingIsActive ? 4 : 32
-        interBatchDelay = textIndexingIsActive ? .milliseconds(750) : .zero
+        batchSize = textIndexingIsActive ? 8 : 32
+        interBatchDelay = textIndexingIsActive ? .milliseconds(300) : .zero
     }
 }
 

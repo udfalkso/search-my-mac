@@ -172,6 +172,23 @@ actor ManifestStore {
         )
     }
 
+    func markRootReconciled(rootID: String) throws {
+        try database.execute(
+            "UPDATE root_events SET last_reconciled_at = ? WHERE root_id = ?",
+            bindings: [.real(Date.now.timeIntervalSince1970), .text(rootID)]
+        )
+    }
+
+    func reconciliationIsDue(rootID: String, maximumAge: TimeInterval) throws -> Bool {
+        guard let lastReconciledAt = try database.query(
+            "SELECT last_reconciled_at FROM root_events WHERE root_id = ?",
+            bindings: [.text(rootID)]
+        ).first?["last_reconciled_at"]?.double else {
+            return true
+        }
+        return Date.now.timeIntervalSince1970 - lastReconciledAt >= maximumAge
+    }
+
     func setDiscoveryErrorCount(rootID: String, count: Int) throws {
         try database.execute(
             "UPDATE root_events SET discovery_error_count = ? WHERE root_id = ?",
@@ -422,11 +439,13 @@ actor ManifestStore {
                 ? document!.passages
                 : [ExtractedPassage(text: "", ordinal: 0, locationKind: .unknown, locationLabel: nil)]
             for passage in passages {
+                let semanticEligible = !passage.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 try database.execute(
-                    "INSERT INTO passages(source_id, ordinal, body, location_kind, location_label) VALUES(?, ?, ?, ?, ?)",
+                    "INSERT INTO passages(source_id, ordinal, body, location_kind, location_label, semantic_eligible) VALUES(?, ?, ?, ?, ?, ?)",
                     bindings: [
                         .text(file.sourceID), .integer(Int64(passage.ordinal)), .text(passage.text),
-                        .text(passage.locationKind.rawValue), passage.locationLabel.map(SQLiteValue.text) ?? .null
+                        .text(passage.locationKind.rawValue), passage.locationLabel.map(SQLiteValue.text) ?? .null,
+                        .integer(semanticEligible ? 1 : 0)
                     ]
                 )
                 let rowID = try database.query("SELECT last_insert_rowid() AS id").first?["id"]?.int64 ?? 0
@@ -642,7 +661,7 @@ actor ManifestStore {
             """
             SELECT COUNT(*) AS total,
                    SUM(CASE WHEN embedding_model = ? THEN 1 ELSE 0 END) AS embedded
-            FROM passages WHERE length(trim(body)) > 0
+            FROM passages WHERE semantic_eligible = 1
             """,
             bindings: [.text(modelID)]
         ).first ?? [:]
@@ -678,7 +697,7 @@ actor ManifestStore {
                 FROM passages p
                 JOIN files f ON f.source_id = p.source_id
                 LEFT JOIN embedded_counts ON embedded_counts.source_id = p.source_id
-                WHERE length(trim(p.body)) > 0
+                WHERE p.semantic_eligible = 1
                   AND COALESCE(p.embedding_model, '') != ?
             )
             SELECT id, body, filename
@@ -732,6 +751,13 @@ actor ManifestStore {
         try database.execute("DELETE FROM semantic_tombstones")
     }
 
+    /// Enhanced document vectors are derived from the same versioned semantic
+    /// representation as passage vectors. A format change invalidates both
+    /// lanes together so mixed generations can never be searched.
+    func resetSemanticDocuments() throws {
+        try database.execute("DELETE FROM semantic_documents")
+    }
+
     func nextSemanticDocuments(modelID: String, limit: Int) throws -> [SemanticDocumentRecord] {
         let rows = try database.query(
             """
@@ -776,11 +802,11 @@ actor ManifestStore {
     func semanticDocumentCounts(modelID: String) throws -> (ready: Int, total: Int) {
         let row = try database.query(
             """
-            SELECT COUNT(DISTINCT f.source_id) AS total,
-                   COUNT(DISTINCT CASE WHEN d.embedding_model = ? THEN d.source_id END) AS ready
-            FROM files f JOIN passages p ON p.source_id = f.source_id
-            LEFT JOIN semantic_documents d ON d.source_id = f.source_id
-            WHERE length(trim(p.body)) > 0
+            SELECT COUNT(DISTINCT p.source_id) AS total,
+                   COUNT(DISTINCT CASE WHEN d.embedding_model = ? THEN p.source_id END) AS ready
+            FROM passages p
+            LEFT JOIN semantic_documents d ON d.source_id = p.source_id
+            WHERE p.semantic_eligible = 1
             """, bindings: [.text(modelID)]
         ).first ?? [:]
         return (Int(row["ready"]?.int64 ?? 0), Int(row["total"]?.int64 ?? 0))
@@ -1255,10 +1281,20 @@ actor ManifestStore {
         )
         try? database.execute("ALTER TABLE passages ADD COLUMN embedding_model TEXT")
         try? database.execute("ALTER TABLE passages ADD COLUMN embedded_at REAL")
+        try? database.execute("ALTER TABLE passages ADD COLUMN semantic_eligible INTEGER NOT NULL DEFAULT 0")
         try database.execute("CREATE INDEX IF NOT EXISTS passages_source_idx ON passages(source_id)")
         try database.execute("CREATE INDEX IF NOT EXISTS passages_embedding_idx ON passages(embedding_model)")
         try database.execute(
             "CREATE INDEX IF NOT EXISTS passages_embedding_source_idx ON passages(embedding_model, source_id)"
+        )
+        try database.execute(
+            "CREATE INDEX IF NOT EXISTS passages_semantic_eligibility_idx ON passages(semantic_eligible, embedding_model, source_id)"
+        )
+        // Older manifests did not persist whether a passage has meaningful
+        // content. Backfill once so live semantic-status polling can use a
+        // covering index instead of repeatedly reading every document body.
+        try database.execute(
+            "UPDATE passages SET semantic_eligible = 1 WHERE semantic_eligible = 0 AND length(trim(body)) > 0"
         )
         try database.execute(
             "CREATE TABLE IF NOT EXISTS semantic_tombstones(passage_id INTEGER PRIMARY KEY)"

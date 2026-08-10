@@ -26,11 +26,13 @@ if [[ -z "${SMM_SIGNING_CONFIG:-}" && ! -f "$LOCAL_SIGNING_CONFIG" ]]; then
 fi
 CONFIG_SIGNING_IDENTITY=""
 CONFIG_TEAM_IDENTIFIER=""
+CONFIG_DISTRIBUTION_SIGNING=""
 if [[ -f "$LOCAL_SIGNING_CONFIG" ]]; then
   while IFS='=' read -r key value; do
     case "$key" in
       SMM_CODESIGN_IDENTITY) CONFIG_SIGNING_IDENTITY="$value" ;;
       SMM_TEAM_ID) CONFIG_TEAM_IDENTIFIER="$value" ;;
+      SMM_DISTRIBUTION_SIGNING) CONFIG_DISTRIBUTION_SIGNING="$value" ;;
     esac
   done < "$LOCAL_SIGNING_CONFIG"
 fi
@@ -41,7 +43,7 @@ if [[ "$SIGNING_IDENTITY" == "-" ]]; then
 fi
 BUILD_CONFIGURATION="${SMM_CONFIGURATION:-debug}"
 PRIVATE_ENTITLEMENTS="${SMM_PRIVATE_ENTITLEMENTS:-0}"
-DISTRIBUTION_SIGNING="${SMM_DISTRIBUTION_SIGNING:-0}"
+DISTRIBUTION_SIGNING="${SMM_DISTRIBUTION_SIGNING:-${CONFIG_DISTRIBUTION_SIGNING:-0}}"
 if [[ -x /opt/homebrew/opt/rust/bin/cargo ]]; then
   CARGO_BIN=/opt/homebrew/opt/rust/bin/cargo
   RUSTC_BIN=/opt/homebrew/opt/rust/bin/rustc
@@ -142,12 +144,37 @@ if [[ "$DISTRIBUTION_SIGNING" == "1" ]]; then
   CODESIGN_ARGUMENTS+=(--options runtime --timestamp)
 fi
 
+# TCC remembers a code requirement, not a binary hash. The default designated
+# requirement generated for Apple Development and Developer ID certificates is
+# intentionally different, so switching between them makes macOS treat a
+# rebuild as a new requester for Desktop, Documents, and Downloads. Pin one
+# explicit, team-scoped requirement for every signed development or release
+# build. It accepts either Apple certificate class for this team, while still
+# requiring this exact bundle identifier.
+APP_REQUIREMENTS=()
+ENGINE_REQUIREMENTS=()
+if [[ "$SIGNING_IDENTITY" != "-" ]]; then
+  APP_REQUIREMENTS=(--requirements "=designated => anchor apple generic and certificate leaf[subject.OU] = \"$TEAM_IDENTIFIER\" and identifier \"com.searchmymac.app\"")
+  ENGINE_REQUIREMENTS=(--requirements "=designated => anchor apple generic and certificate leaf[subject.OU] = \"$TEAM_IDENTIFIER\" and identifier \"com.searchmymac.app.engine\"")
+fi
+
 codesign "${CODESIGN_ARGUMENTS[@]}" "$APP_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
 codesign "${CODESIGN_ARGUMENTS[@]}" "$XPC_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
 codesign "${CODESIGN_ARGUMENTS[@]}" "$APP_ROOT/Contents/Frameworks/llama.framework"
 codesign "${CODESIGN_ARGUMENTS[@]}" "$XPC_ROOT/Contents/Frameworks/llama.framework"
 codesign "${CODESIGN_ARGUMENTS[@]}" --identifier "com.searchmymac.cli" "$APP_ROOT/Contents/Helpers/smm"
-codesign "${CODESIGN_ARGUMENTS[@]}" --entitlements "$ENGINE_ENTITLEMENTS" "$XPC_ROOT"
-codesign "${CODESIGN_ARGUMENTS[@]}" --entitlements "$APP_ENTITLEMENTS" "$APP_ROOT"
+codesign "${CODESIGN_ARGUMENTS[@]}" "${ENGINE_REQUIREMENTS[@]}" --entitlements "$ENGINE_ENTITLEMENTS" "$XPC_ROOT"
+codesign "${CODESIGN_ARGUMENTS[@]}" "${APP_REQUIREMENTS[@]}" --entitlements "$APP_ENTITLEMENTS" "$APP_ROOT"
+
+if [[ "$SIGNING_IDENTITY" != "-" ]]; then
+  EXPECTED_APP_REQUIREMENT="designated => anchor apple generic and certificate leaf[subject.OU] = $TEAM_IDENTIFIER and identifier \"com.searchmymac.app\""
+  EXPECTED_ENGINE_REQUIREMENT="designated => anchor apple generic and certificate leaf[subject.OU] = $TEAM_IDENTIFIER and identifier \"com.searchmymac.app.engine\""
+  ACTUAL_APP_REQUIREMENT="$(codesign -d -r- "$APP_ROOT" 2>&1 | sed -n 's/^designated => /designated => /p')"
+  ACTUAL_ENGINE_REQUIREMENT="$(codesign -d -r- "$XPC_ROOT" 2>&1 | sed -n 's/^designated => /designated => /p')"
+  if [[ "$ACTUAL_APP_REQUIREMENT" != "$EXPECTED_APP_REQUIREMENT" || "$ACTUAL_ENGINE_REQUIREMENT" != "$EXPECTED_ENGINE_REQUIREMENT" ]]; then
+    echo "The signed bundle does not have the stable TCC designated requirement." >&2
+    exit 1
+  fi
+fi
 
 echo "$APP_ROOT"

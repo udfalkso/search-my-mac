@@ -6,7 +6,7 @@ struct SemanticModelDescriptor: Sendable {
     /// Bump when the text sent to the embedding model changes. Existing vectors
     /// then need a semantic-only rebuild; the lexical index and source files are
     /// unaffected.
-    static let embeddingFormatVersion = 4
+    static let embeddingFormatVersion = 5
 
     /// The compact, capable baseline required for meaning-based search.
     /// It keeps Semantic Search practical for every user.
@@ -249,11 +249,13 @@ package final class QwenEmbeddingModel: @unchecked Sendable {
     private let inferenceLock = NSLock()
     let dimensions: Int
     private let maximumTokens: Int
+    private let maximumBatchSequences: Int
 
     package init(
         url: URL,
         dimensions: Int = 1_024,
-        maximumTokens: Int = 2_048,
+        maximumTokens: Int = 768,
+        maximumBatchSequences: Int = 2,
         useGPU: Bool = true,
         suppressLogs: Bool = false
     ) throws {
@@ -273,12 +275,14 @@ package final class QwenEmbeddingModel: @unchecked Sendable {
         model = loadedModel
         self.dimensions = min(dimensions, Int(llama_model_n_embd(loadedModel)))
         self.maximumTokens = maximumTokens
+        self.maximumBatchSequences = max(1, maximumBatchSequences)
 
         var contextParameters = llama_context_default_params()
-        contextParameters.n_ctx = UInt32(maximumTokens)
-        contextParameters.n_batch = UInt32(maximumTokens)
-        contextParameters.n_ubatch = UInt32(min(maximumTokens, 512))
-        contextParameters.n_seq_max = 1
+        let batchTokenCapacity = maximumTokens * self.maximumBatchSequences
+        contextParameters.n_ctx = UInt32(batchTokenCapacity)
+        contextParameters.n_batch = UInt32(batchTokenCapacity)
+        contextParameters.n_ubatch = UInt32(min(batchTokenCapacity, 512))
+        contextParameters.n_seq_max = UInt32(self.maximumBatchSequences)
         contextParameters.n_threads = Int32(max(1, ProcessInfo.processInfo.activeProcessorCount / 2))
         contextParameters.n_threads_batch = Int32(max(1, ProcessInfo.processInfo.activeProcessorCount / 2))
         contextParameters.embeddings = true
@@ -328,6 +332,52 @@ package final class QwenEmbeddingModel: @unchecked Sendable {
         try embed(text)
     }
 
+    /// Embeds independent passages in one llama.cpp decode. This is materially
+    /// faster than launching one model pass per passage, particularly during
+    /// the initial index. The public worker keeps batches small enough that
+    /// foreground search remains responsive.
+    package func embedDocuments(_ texts: [String]) throws -> [[Float]] {
+        guard !texts.isEmpty else { return [] }
+        guard texts.count <= maximumBatchSequences else {
+            throw SearchMyMacError.semantic("Embedding batch exceeds the model context capacity.")
+        }
+        inferenceLock.lock()
+        defer { inferenceLock.unlock() }
+        guard let model, let context else { throw SearchMyMacError.semantic("The model is not loaded.") }
+        let vocabulary = llama_model_get_vocab(model)
+        let tokenGroups = try texts.map { try preparedTokens(for: $0, vocabulary: vocabulary) }
+        let tokenCount = tokenGroups.reduce(0) { $0 + $1.count }
+        guard tokenCount <= maximumTokens * maximumBatchSequences else {
+            throw SearchMyMacError.semantic("Embedding batch exceeds the model token capacity.")
+        }
+
+        llama_memory_clear(llama_get_memory(context), true)
+        var batch = llama_batch_init(Int32(tokenCount), 0, Int32(texts.count))
+        batch.n_tokens = Int32(tokenCount)
+        defer { llama_batch_free(batch) }
+        var index = 0
+        for (sequence, tokens) in tokenGroups.enumerated() {
+            for (position, token) in tokens.enumerated() {
+                batch.token[index] = token
+                batch.pos[index] = llama_pos(position)
+                batch.n_seq_id[index] = 1
+                batch.seq_id[index]?.pointee = llama_seq_id(sequence)
+                batch.logits[index] = position == tokens.indices.last ? 1 : 0
+                index += 1
+            }
+        }
+        let decodeResult = llama_decode(context, batch)
+        guard decodeResult == 0 else {
+            throw SearchMyMacError.semantic("Qwen3 batch inference failed with code \(decodeResult).")
+        }
+        return try texts.indices.map { sequence in
+            guard let output = llama_get_embeddings_seq(context, llama_seq_id(sequence)) else {
+                throw SearchMyMacError.semantic("Qwen3 did not return a pooled embedding.")
+            }
+            return try normalizedEmbedding(output)
+        }
+    }
+
     package func embedQuery(_ query: String) throws -> [Float] {
         let instruction = "Instruct: Given a search query, retrieve relevant passages from files on this Mac that answer or relate to the query\nQuery: \(query)"
         return try embed(instruction)
@@ -340,12 +390,7 @@ package final class QwenEmbeddingModel: @unchecked Sendable {
         let vocab = llama_model_get_vocab(model)
         // This GGUF declares add_eos_token=true. Asking llama.cpp to add special
         // tokens supplies the single final token required for last-token pooling.
-        var tokens = try tokenize(text, vocabulary: vocab)
-        guard !tokens.isEmpty else { throw SearchMyMacError.semantic("The tokenizer produced no input.") }
-        if tokens.count > maximumTokens {
-            let finalToken = tokens.last!
-            tokens = Array(tokens.prefix(maximumTokens - 1)) + [finalToken]
-        }
+        var tokens = try preparedTokens(for: text, vocabulary: vocab)
 
         llama_memory_clear(llama_get_memory(context), true)
         let decodeResult = tokens.withUnsafeMutableBufferPointer { buffer in
@@ -357,6 +402,20 @@ package final class QwenEmbeddingModel: @unchecked Sendable {
         guard let output = llama_get_embeddings_seq(context, 0) else {
             throw SearchMyMacError.semantic("Qwen3 did not return a pooled embedding.")
         }
+        return try normalizedEmbedding(output)
+    }
+
+    private func preparedTokens(for text: String, vocabulary: OpaquePointer?) throws -> [llama_token] {
+        var tokens = try tokenize(text, vocabulary: vocabulary)
+        guard !tokens.isEmpty else { throw SearchMyMacError.semantic("The tokenizer produced no input.") }
+        if tokens.count > maximumTokens {
+            let finalToken = tokens.last!
+            tokens = Array(tokens.prefix(maximumTokens - 1)) + [finalToken]
+        }
+        return tokens
+    }
+
+    private func normalizedEmbedding(_ output: UnsafePointer<Float>) throws -> [Float] {
         var vector = Array(UnsafeBufferPointer(start: output, count: dimensions))
         let norm = sqrt(vector.reduce(0) { $0 + $1 * $1 })
         guard norm.isFinite, norm > 0 else { throw SearchMyMacError.semantic("Qwen3 returned an invalid embedding.") }

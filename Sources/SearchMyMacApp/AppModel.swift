@@ -92,7 +92,6 @@ final class AppModel: ObservableObject {
                 }
             }
             catch { errorMessage = error.localizedDescription }
-            if !roots.isEmpty { await reconcileRoots() }
             do { try await engine?.startMonitoring() }
             catch { errorMessage = error.localizedDescription }
         }

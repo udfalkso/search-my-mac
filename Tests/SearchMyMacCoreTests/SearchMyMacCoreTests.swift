@@ -33,10 +33,23 @@ import Testing
 @Test func semanticWorkContinuesAtReducedRateDuringTextIndexing() {
     let contended = SemanticWorkSchedule(textIndexingIsActive: true)
     let idle = SemanticWorkSchedule(textIndexingIsActive: false)
-    #expect(contended.batchSize == 4)
+    #expect(contended.batchSize == 8)
     #expect(contended.interBatchDelay > .zero)
     #expect(idle.batchSize > contended.batchSize)
     #expect(idle.interBatchDelay == .zero)
+}
+
+@Test func startupReconciliationWaitsUntilTheStoredIntervalExpires() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("searchmymac-reconciliation-schedule-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try ManifestStore(databaseURL: directory.appendingPathComponent("manifest.sqlite3"))
+    let root = IndexRoot(id: "fixture", url: directory)
+    try await store.addRoot(root)
+
+    #expect(try await store.reconciliationIsDue(rootID: root.id, maximumAge: 86_400))
+    try await store.markRootReconciled(rootID: root.id)
+    #expect(!(try await store.reconciliationIsDue(rootID: root.id, maximumAge: 86_400)))
 }
 
 @Test func extractionFailuresAreExposedAsActionableIndexIssues() async throws {
@@ -813,6 +826,30 @@ private struct StubOCRTextRecognizer: OCRTextRecognizing {
     let relevantScore = zip(document, query).reduce(Float.zero) { $0 + $1.0 * $1.1 }
     let unrelatedScore = zip(unrelated, query).reduce(Float.zero) { $0 + $1.0 * $1.1 }
     #expect(relevantScore > unrelatedScore)
+}
+
+@Test func qwenEmbeddingBatchRuntimeSmokeTestWhenModelIsProvided() throws {
+    guard let path = ProcessInfo.processInfo.environment["SMM_QWEN_MODEL_PATH"] else { return }
+    let model = try QwenEmbeddingModel(url: URL(fileURLWithPath: path), maximumTokens: 256, maximumBatchSequences: 4)
+    defer { model.shutdown() }
+    let vectors = try model.embedDocuments([
+        "Mortgage financing and closing costs for buying a home.",
+        "A recipe for fresh tomato soup with basil."
+    ])
+    #expect(vectors.count == 2)
+    #expect(vectors.allSatisfy { $0.count == SemanticModelDescriptor.qwen3.dimensions })
+    #expect(vectors.allSatisfy { abs($0.reduce(0) { $0 + $1 * $1 } - 1) < 0.001 })
+}
+
+@Test func qwenEmbeddingProductionBatchSmokeTestWhenModelIsProvided() throws {
+    guard let path = ProcessInfo.processInfo.environment["SMM_QWEN_MODEL_PATH"] else { return }
+    let model = try QwenEmbeddingModel(url: URL(fileURLWithPath: path))
+    defer { model.shutdown() }
+    let passage = Array(repeating: "Mortgage financing, closing costs, home purchase, property, lender, and monthly payment.", count: 50)
+        .joined(separator: " ")
+    let vectors = try model.embedDocuments([passage, passage])
+    #expect(vectors.count == 2)
+    #expect(vectors.allSatisfy { $0.count == SemanticModelDescriptor.qwen3.dimensions })
 }
 
 @Test func xpcInterfaceUsesExplicitSecureClassLists() {

@@ -30,6 +30,7 @@ public protocol SearchEngine: Sendable {
     func saveSearch(_ savedSearch: SavedSearch) async throws
     func deleteSavedSearch(id: String) async throws
     func startMonitoring() async throws
+    func startupReconciliationIsDue(maximumAge: TimeInterval) async throws -> Bool
     func stopMonitoring() async
     func shutdown() async
 }
