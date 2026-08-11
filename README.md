@@ -48,9 +48,21 @@ Build an installer package that places the app in `/Applications` and the
 ./scripts/build-installer.sh
 ```
 
-Set `SMM_INSTALLER_IDENTITY` to a Developer ID Installer identity for a signed
-distribution package. Without it, the script creates an unsigned development
-package.
+Set `SMM_INSTALLER_IDENTITY` to sign this development/testing package with a
+Developer ID Installer identity. Without it, the script creates an unsigned
+package. Use the public release workflow below for distribution to other Macs.
+
+Build the public installer with Developer ID Application and Installer
+signatures, Apple notarization, a stapled offline ticket, and Gatekeeper
+validation:
+
+```sh
+./scripts/notarize-installer.sh
+```
+
+The public workflow requires both Developer ID certificate types and either an
+authenticated `asc` profile or `SMM_NOTARY_PROFILE` for `notarytool`. It writes
+the final versioned package to `.build/distribution/`.
 
 For stable Apple Development or Developer ID signing, set `SMM_CODESIGN_IDENTITY` and `SMM_TEAM_ID`, or place them in a local `.smm-signing.env` file. The local file is ignored by git. Prefer the certificate's SHA-1 fingerprint when duplicate certificate names exist. Signed development builds use Team-ID-and-bundle-ID-pinned mutual XPC requirements while retaining launch-safe development entitlements. Set `SMM_PRIVATE_ENTITLEMENTS=1` only for a provisioned distribution build that authorizes the private client/service marker entitlements. Ad-hoc builds use identifier-only development requirements; because their designated requirement is a changing code hash, macOS privacy permissions may be requested again after each rebuild.
 

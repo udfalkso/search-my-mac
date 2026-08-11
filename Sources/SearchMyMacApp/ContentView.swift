@@ -1993,16 +1993,38 @@ private struct ResultPreviewPane: View {
 private struct QuickLookPreview: NSViewRepresentable {
     let url: URL
 
+    final class Coordinator {
+        var previewURL: URL?
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
     func makeNSView(context: Context) -> QLPreviewView {
         let view = QLPreviewView(frame: .zero, style: .normal)
+        // SwiftUI can retain the representable while its host window is closed.
+        // Keep Quick Look from permanently deactivating that retained view; the
+        // representable closes it explicitly when SwiftUI dismantles it instead.
+        view?.shouldCloseWithWindow = false
         view?.autostarts = true
         view?.previewItem = url as NSURL
+        context.coordinator.previewURL = url
         return view ?? QLPreviewView(frame: .zero, style: .normal)!
     }
 
     func updateNSView(_ nsView: QLPreviewView, context: Context) {
+        // Assigning a preview item to a deactivated QLPreviewView aborts the
+        // process on macOS 14. Avoid touching Quick Look for unrelated SwiftUI
+        // updates, which make up nearly all calls to this method.
+        guard context.coordinator.previewURL != url else { return }
+        context.coordinator.previewURL = url
         nsView.previewItem = url as NSURL
-        nsView.refreshPreviewItem()
+    }
+
+    static func dismantleNSView(_ nsView: QLPreviewView, coordinator: Coordinator) {
+        coordinator.previewURL = nil
+        nsView.close()
     }
 }
 
