@@ -7,12 +7,14 @@ import SwiftUI
 struct SearchMyMacApplication: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = AppModel()
+    @StateObject private var updates = UpdateController()
     @AppStorage(AppAppearance.storageKey) private var appearance = AppAppearance.system.rawValue
 
     var body: some Scene {
         WindowGroup("Search My Mac") {
             ContentView()
                 .environmentObject(model)
+                .environmentObject(updates)
                 .preferredColorScheme(selectedAppearance.colorScheme)
                 .frame(minWidth: 920, minHeight: 620)
                 .onAppear { appDelegate.model = model }
@@ -30,6 +32,11 @@ struct SearchMyMacApplication: App {
                     NotificationCenter.default.post(name: .showSearchMyMacSettings, object: nil)
                 }
                 .keyboardShortcut(",", modifiers: [.command])
+            }
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") {
+                    updates.checkForUpdates()
+                }
             }
         }
     }

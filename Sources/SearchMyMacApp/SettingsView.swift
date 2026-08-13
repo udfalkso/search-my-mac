@@ -3,6 +3,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var updates: UpdateController
     @AppStorage("settings.selectedTab") private var selectedTab = "general"
     @AppStorage(AppAppearance.storageKey) private var appearance = AppAppearance.system.rawValue
     @State private var showsClearHistoryConfirmation = false
@@ -21,12 +22,13 @@ struct SettingsView: View {
 
                 Picker("Settings section", selection: $selectedTab) {
                     Text("General").tag("general")
+                    Text("Updates").tag("updates")
                     Text("Semantic").tag("semantic")
                     Text("Privacy").tag("privacy")
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
-                .frame(width: 330)
+                .frame(width: 430)
             }
             .padding(.horizontal, 30)
             .padding(.vertical, 22)
@@ -40,10 +42,118 @@ struct SettingsView: View {
     @ViewBuilder
     private var selectedSettings: some View {
         switch selectedTab {
+        case "updates": updatesSettings
         case "semantic": semanticSettings
         case "privacy": privacySettings
         default: generalSettings
         }
+    }
+
+    private var updatesSettings: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 26) {
+                settingsHeader(
+                    title: "Updates",
+                    subtitle: "Keep Search My Mac current and secure",
+                    symbol: "arrow.triangle.2.circlepath"
+                )
+
+                VStack(spacing: 0) {
+                    HStack(spacing: 18) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Search My Mac \(updates.installedVersion)")
+                                .font(.headline)
+                            if let lastCheck = updates.lastUpdateCheckDate {
+                                Text("Last checked \(lastCheck.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Text("No update check has completed yet.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer(minLength: 12)
+                        Button("Check Now") { updates.checkForUpdates() }
+                            .buttonStyle(.borderedProminent)
+                    }
+                    .padding(18)
+
+                    Divider().padding(.leading, 18)
+
+                    Toggle(isOn: Binding(
+                        get: { updates.automaticallyChecksForUpdates },
+                        set: { updates.setAutomaticallyChecksForUpdates($0) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Check for updates automatically")
+                                .font(.headline)
+                            Text("Search My Mac checks GitHub for signed releases on your chosen schedule.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .padding(18)
+
+                    Divider().padding(.leading, 18)
+
+                    HStack(spacing: 24) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Check frequency")
+                                .font(.headline)
+                            Text("Scheduled checks run quietly in the background.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 12)
+                        Picker("Check frequency", selection: Binding(
+                            get: { updates.checkFrequency },
+                            set: { updates.setCheckFrequency($0) }
+                        )) {
+                            ForEach(UpdateCheckFrequency.allCases) { frequency in
+                                Text(frequency.title).tag(frequency)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(width: 140)
+                        .disabled(!updates.automaticallyChecksForUpdates)
+                    }
+                    .padding(18)
+
+                    Divider().padding(.leading, 18)
+
+                    Toggle(isOn: Binding(
+                        get: { updates.automaticallyDownloadsUpdates },
+                        set: { updates.setAutomaticallyDownloadsUpdates($0) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Download and install updates automatically")
+                                .font(.headline)
+                            Text("Signed updates download in the background and install safely when the app is ready to relaunch.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .padding(18)
+                    .disabled(!updates.automaticallyChecksForUpdates)
+                }
+                .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                Label(
+                    "Every update is verified with Search My Mac’s update-signing key and Apple code signing before installation.",
+                    systemImage: "checkmark.shield.fill"
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: 680, alignment: .leading)
+            .padding(.horizontal, 36)
+            .padding(.vertical, 30)
+            .frame(maxWidth: .infinity, alignment: .center)
+        }
+        .onAppear { updates.refresh() }
     }
 
     private var generalSettings: some View {

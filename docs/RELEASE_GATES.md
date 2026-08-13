@@ -46,5 +46,6 @@ The following items are deliberately tracked as release blockers rather than bei
 ## Distribution
 
 - Produce universal or separately distributed Apple-silicon/Intel builds.
-- Add app icon, accessibility audit, VoiceOver labels, localization readiness, update signing, notarization, and a privacy disclosure.
+- Complete the accessibility audit, VoiceOver labels, localization readiness, and privacy disclosure.
+- Smoke-test the signed Sparkle update path from every supported macOS baseline before the first public rollout.
 - Run `codesign --verify --deep --strict`, notarization, stapling, and Gatekeeper validation on every release artifact.

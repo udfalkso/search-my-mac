@@ -78,6 +78,13 @@ if [[ ! -d "$BIN_PATH/llama.framework" ]]; then
 fi
 cp -R "$BIN_PATH/llama.framework" "$APP_ROOT/Contents/Frameworks/llama.framework"
 cp -R "$BIN_PATH/llama.framework" "$XPC_ROOT/Contents/Frameworks/llama.framework"
+if [[ ! -d "$BIN_PATH/Sparkle.framework" ]]; then
+  echo "SwiftPM did not stage Sparkle.framework beside the app executable." >&2
+  exit 1
+fi
+# ditto preserves the framework's versioned symlinks and executable bits,
+# which are part of both Sparkle's runtime layout and its code signature.
+ditto "$BIN_PATH/Sparkle.framework" "$APP_ROOT/Contents/Frameworks/Sparkle.framework"
 
 # SwiftPM's executable products only carry @loader_path by default. Bundled
 # frameworks live one level above MacOS, so add the standard app-bundle rpath
@@ -162,6 +169,16 @@ codesign "${CODESIGN_ARGUMENTS[@]}" "$APP_ROOT/Contents/Frameworks/libsearchmyma
 codesign "${CODESIGN_ARGUMENTS[@]}" "$XPC_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
 codesign "${CODESIGN_ARGUMENTS[@]}" "$APP_ROOT/Contents/Frameworks/llama.framework"
 codesign "${CODESIGN_ARGUMENTS[@]}" "$XPC_ROOT/Contents/Frameworks/llama.framework"
+if [[ "$SIGNING_IDENTITY" != "-" ]]; then
+  SPARKLE_VERSION_ROOT="$APP_ROOT/Contents/Frameworks/Sparkle.framework/Versions/B"
+  # Sparkle's helpers have different signing requirements. Sign them in the
+  # documented inside-out order and preserve Downloader's shipped entitlement.
+  codesign "${CODESIGN_ARGUMENTS[@]}" "$SPARKLE_VERSION_ROOT/XPCServices/Installer.xpc"
+  codesign "${CODESIGN_ARGUMENTS[@]}" --preserve-metadata=entitlements "$SPARKLE_VERSION_ROOT/XPCServices/Downloader.xpc"
+  codesign "${CODESIGN_ARGUMENTS[@]}" "$SPARKLE_VERSION_ROOT/Autoupdate"
+  codesign "${CODESIGN_ARGUMENTS[@]}" "$SPARKLE_VERSION_ROOT/Updater.app"
+  codesign "${CODESIGN_ARGUMENTS[@]}" "$APP_ROOT/Contents/Frameworks/Sparkle.framework"
+fi
 codesign "${CODESIGN_ARGUMENTS[@]}" --identifier "com.searchmymac.cli" "$APP_ROOT/Contents/Helpers/smm"
 codesign "${CODESIGN_ARGUMENTS[@]}" "${ENGINE_REQUIREMENTS[@]}" --entitlements "$ENGINE_ENTITLEMENTS" "$XPC_ROOT"
 codesign "${CODESIGN_ARGUMENTS[@]}" "${APP_REQUIREMENTS[@]}" --entitlements "$APP_ENTITLEMENTS" "$APP_ROOT"

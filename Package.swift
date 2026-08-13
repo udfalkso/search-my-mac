@@ -12,6 +12,7 @@ let package = Package(
         .executable(name: "SearchMyMacEngineService", targets: ["SearchMyMacEngineService"])
     ],
     dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.9.2"),
         .package(url: "https://github.com/unum-cloud/USearch.git", exact: "2.26.0")
     ],
     targets: [
@@ -32,7 +33,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "SearchMyMacApp",
-            dependencies: ["SearchMyMacCore"],
+            dependencies: [
+                "SearchMyMacCore",
+                .product(name: "Sparkle", package: "Sparkle")
+            ],
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("QuickLookUI"),
