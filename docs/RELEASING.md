@@ -45,10 +45,17 @@ developer Mac. GitHub hosts the finished artifacts but does not build them.
    Push that commit to GitHub. The publisher intentionally refuses to release a
    dirty tracked worktree.
 
-3. Write Markdown release notes, then publish from the committed checkout:
+3. Supply short Markdown release notes directly, then publish from the committed
+   checkout:
 
    ```sh
-   ./scripts/publish-release.sh --notes /path/to/release-notes.md
+   ./scripts/publish-release.sh --notes "Add signed, automatic in-app updates."
+   ```
+
+   For longer notes, read Markdown from a file instead:
+
+   ```sh
+   ./scripts/publish-release.sh --notes-file /path/to/release-notes.md
    ```
 
    Add `--draft` to upload a private draft for inspection. Publishing the draft

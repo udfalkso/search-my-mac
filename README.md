@@ -88,7 +88,7 @@ the login Keychain, and uploads both as GitHub Release assets:
 ```sh
 ./scripts/set-version.sh 0.2.0 2
 # Review, commit, and push the version change and release code.
-./scripts/publish-release.sh --notes /path/to/release-notes.md
+./scripts/publish-release.sh --notes "Add signed, automatic in-app updates."
 ```
 
 See [Publishing a release](docs/RELEASING.md) for one-time setup, draft releases,

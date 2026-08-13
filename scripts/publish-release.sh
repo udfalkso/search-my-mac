@@ -9,13 +9,17 @@ APP_INFO="$PROJECT_ROOT/Resources/App/Info.plist"
 ENGINE_INFO="$PROJECT_ROOT/Resources/EngineXPC/Info.plist"
 REPOSITORY="${SMM_GITHUB_REPOSITORY:-udfalkso/search-my-mac}"
 DRAFT=0
+NOTES=""
 NOTES_FILE=""
+NOTES_SOURCE=""
 
 usage() {
   cat >&2 <<EOF
-Usage: $0 --notes <markdown-file> [--draft]
+Usage: $0 (--notes <markdown> | --notes-file <markdown-file>) [--draft]
 
 Builds, signs, notarizes, and publishes the committed version from Info.plist.
+Pass short Markdown release notes directly with --notes, or read longer notes
+from a file with --notes-file. Specify exactly one notes option.
 Use --draft to create a GitHub draft release instead of publishing immediately.
 EOF
 }
@@ -24,7 +28,22 @@ while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --notes)
       [[ "$#" -ge 2 ]] || { usage; exit 2; }
+      if [[ -n "$NOTES_SOURCE" ]]; then
+        echo "Specify exactly one of --notes or --notes-file." >&2
+        exit 2
+      fi
+      NOTES="$2"
+      NOTES_SOURCE="string"
+      shift 2
+      ;;
+    --notes-file)
+      [[ "$#" -ge 2 ]] || { usage; exit 2; }
+      if [[ -n "$NOTES_SOURCE" ]]; then
+        echo "Specify exactly one of --notes or --notes-file." >&2
+        exit 2
+      fi
       NOTES_FILE="$2"
+      NOTES_SOURCE="file"
       shift 2
       ;;
     --draft)
@@ -43,12 +62,22 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$NOTES_FILE" || ! -f "$NOTES_FILE" ]]; then
-  echo "A Markdown release-notes file is required." >&2
+if [[ -z "$NOTES_SOURCE" ]]; then
+  echo "Specify exactly one of --notes or --notes-file." >&2
   usage
   exit 2
 fi
-NOTES_FILE="$(cd "$(dirname "$NOTES_FILE")" && pwd)/$(basename "$NOTES_FILE")"
+if [[ "$NOTES_SOURCE" == "string" && -z "$NOTES" ]]; then
+  echo "--notes cannot be empty." >&2
+  exit 2
+fi
+if [[ "$NOTES_SOURCE" == "file" ]]; then
+  if [[ ! -f "$NOTES_FILE" ]]; then
+    echo "Release-notes file does not exist: $NOTES_FILE" >&2
+    exit 2
+  fi
+  NOTES_FILE="$(cd "$(dirname "$NOTES_FILE")" && pwd)/$(basename "$NOTES_FILE")"
+fi
 
 for COMMAND in gh git xmllint; do
   if ! command -v "$COMMAND" >/dev/null; then
@@ -120,7 +149,12 @@ esac
 rm -rf "$RELEASE_ROOT"
 mkdir -p "$RELEASE_ROOT"
 ditto "$ARCHIVE_PATH" "$RELEASE_ROOT/$(basename "$ARCHIVE_PATH")"
-ditto "$NOTES_FILE" "$RELEASE_ROOT/Search My Mac-$VERSION.md"
+STAGED_NOTES_PATH="$RELEASE_ROOT/Search My Mac-$VERSION.md"
+if [[ "$NOTES_SOURCE" == "string" ]]; then
+  printf '%s\n' "$NOTES" > "$STAGED_NOTES_PATH"
+else
+  ditto "$NOTES_FILE" "$STAGED_NOTES_PATH"
+fi
 
 DOWNLOAD_PREFIX="https://github.com/$REPOSITORY/releases/download/$TAG/"
 "$SPARKLE_TOOLS/generate_appcast" \
@@ -152,7 +186,7 @@ GH_ARGUMENTS=(
   --repo "$REPOSITORY"
   --target "$COMMIT_SHA"
   --title "Search My Mac $VERSION"
-  --notes-file "$NOTES_FILE"
+  --notes-file "$STAGED_NOTES_PATH"
 )
 if [[ "$DRAFT" == "1" ]]; then
   GH_ARGUMENTS+=(--draft)
