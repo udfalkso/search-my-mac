@@ -13,6 +13,12 @@ telemetry or document/query upload. Optional semantic search runs locally with
 verified Qwen3 models; the only model-related network activity is the download
 you explicitly start.
 
+## Download
+
+[Download the latest notarized installer](https://github.com/udfalkso/search-my-mac/releases/latest/download/Search-My-Mac.pkg),
+or browse [all Search My Mac releases](https://github.com/udfalkso/search-my-mac/releases)
+for version notes and previous downloads.
+
 This repository can produce a runnable, signed, and notarized v0.1 engineering
 preview. The core search experience works end to end, while the remaining
 hardening and scale work is tracked in
