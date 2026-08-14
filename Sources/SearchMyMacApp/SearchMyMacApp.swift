@@ -77,6 +77,7 @@ enum AppAppearance: String, CaseIterable, Identifiable {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
     private var terminationIsPending = false
+    private var forcedTerminationTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         GlobalHotKeyController.shared.start()
@@ -90,8 +91,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         guard !terminationIsPending else { return .terminateLater }
         terminationIsPending = true
-        Task {
+        // llama.cpp inference is synchronous and cannot observe Swift task
+        // cancellation until the current decode returns. Begin the complete
+        // graceful shutdown, but do not let one background batch keep the Dock
+        // icon alive indefinitely. SQLite uses WAL and atomic transactions, so
+        // work committed before the deadline remains durable and an in-flight
+        // transaction is safely rolled back on the next open.
+        forcedTerminationTask = Task.detached(priority: .userInitiated) {
+            do {
+                try await Task.sleep(for: .seconds(2))
+            } catch {
+                return
+            }
+            Darwin._exit(EXIT_SUCCESS)
+        }
+        Task { [weak self] in
             await model.shutdown()
+            self?.forcedTerminationTask?.cancel()
             // llama.cpp b9632 leaves a Metal residency-set maintenance block alive
             // after its model and context are released. Its process-global C++
             // destructor then asserts while that block still owns a residency set.
