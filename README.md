@@ -83,12 +83,19 @@ timestamp, notarization ticket, and Gatekeeper acceptance.
 Versioned GitHub releases and in-app updates are built and published from the
 developer Mac. After setting and committing a version, the local publisher
 creates the notarized ZIP, signs its Sparkle update feed with the private key in
-the login Keychain, and uploads both as GitHub Release assets:
+the login Keychain, creates a notarized Installer package, and uploads all three
+as GitHub Release assets:
 
 ```sh
 ./scripts/set-version.sh 0.2.0 2
 # Review, commit, and push the version change and release code.
 ./scripts/publish-release.sh --notes "Add signed, automatic in-app updates."
+```
+
+For nontechnical users, share the stable latest-installer link:
+
+```text
+https://github.com/udfalkso/search-my-mac/releases/latest/download/Search-My-Mac.pkg
 ```
 
 See [Publishing a release](docs/RELEASING.md) for one-time setup, draft releases,

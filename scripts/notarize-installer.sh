@@ -73,13 +73,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Building Search My Mac with Developer ID Application signing…"
-env \
-  SMM_APP_ROOT="$APP_PATH" \
-  SMM_CONFIGURATION=release \
-  SMM_DISTRIBUTION_SIGNING=1 \
-  SMM_CODESIGN_IDENTITY="$APPLICATION_IDENTITY" \
-  "$PROJECT_ROOT/scripts/build-app.sh"
+if [[ "${SMM_REUSE_DISTRIBUTION_APP:-0}" == "1" ]]; then
+  if [[ ! -d "$APP_PATH" ]]; then
+    echo "No existing distribution app is available to package: $APP_PATH" >&2
+    exit 1
+  fi
+  echo "Reusing the existing notarized distribution app…"
+else
+  echo "Building Search My Mac with Developer ID Application signing…"
+  env \
+    SMM_APP_ROOT="$APP_PATH" \
+    SMM_CONFIGURATION=release \
+    SMM_DISTRIBUTION_SIGNING=1 \
+    SMM_CODESIGN_IDENTITY="$APPLICATION_IDENTITY" \
+    "$PROJECT_ROOT/scripts/build-app.sh"
+fi
 
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 APP_SIGNATURE_INFO="$(codesign -dvv "$APP_PATH" 2>&1)"
@@ -90,6 +98,10 @@ fi
 if ! grep -Fq 'Timestamp=' <<<"$APP_SIGNATURE_INFO"; then
   echo "The packaged app signature does not have a secure timestamp." >&2
   exit 1
+fi
+if [[ "${SMM_REUSE_DISTRIBUTION_APP:-0}" == "1" ]]; then
+  xcrun stapler validate "$APP_PATH"
+  spctl -a -vvv -t execute "$APP_PATH"
 fi
 
 mkdir -p "$STAGING_ROOT/Applications" "$STAGING_ROOT/usr/local/bin"

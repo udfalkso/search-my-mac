@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Builds and notarizes the app on this Mac, creates a signed Sparkle appcast,
-# then publishes both artifacts to a GitHub Release. GitHub does no building.
+# Builds and notarizes the app and installer on this Mac, creates a signed
+# Sparkle appcast, then publishes the artifacts to GitHub. GitHub does no building.
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_INFO="$PROJECT_ROOT/Resources/App/Info.plist"
@@ -114,6 +114,12 @@ if ! gh api "repos/$REPOSITORY/commits/$COMMIT_SHA" --silent >/dev/null 2>&1; th
   echo "Commit $COMMIT_SHA is not available in $REPOSITORY. Push it before publishing." >&2
   exit 1
 fi
+REPOSITORY_VISIBILITY="$(gh repo view "$REPOSITORY" --json visibility --jq '.visibility')"
+if [[ "$REPOSITORY_VISIBILITY" != "PUBLIC" ]]; then
+  echo "GitHub release repository $REPOSITORY is $REPOSITORY_VISIBILITY." >&2
+  echo "Sparkle requires a public repository so it can download the appcast and update archive without GitHub authentication." >&2
+  exit 1
+fi
 if gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
   echo "GitHub Release $TAG already exists." >&2
   exit 1
@@ -141,6 +147,17 @@ if [[ ! -f "$ARCHIVE_PATH" ]]; then
   exit 1
 fi
 
+echo "Building and notarizing the installer package…"
+env \
+  SMM_DISTRIBUTION_OUTPUT_DIR="$OUTPUT_ROOT" \
+  SMM_REUSE_DISTRIBUTION_APP=1 \
+  "$PROJECT_ROOT/scripts/notarize-installer.sh"
+PACKAGE_PATH="$OUTPUT_ROOT/Search My Mac-$VERSION.pkg"
+if [[ ! -f "$PACKAGE_PATH" ]]; then
+  echo "Expected notarized installer was not created: $PACKAGE_PATH" >&2
+  exit 1
+fi
+
 RELEASE_ROOT="$OUTPUT_ROOT/github-$TAG"
 case "$RELEASE_ROOT" in
   "$PROJECT_ROOT"/.build/distribution/github-v*) ;;
@@ -148,7 +165,8 @@ case "$RELEASE_ROOT" in
 esac
 rm -rf "$RELEASE_ROOT"
 mkdir -p "$RELEASE_ROOT"
-ditto "$ARCHIVE_PATH" "$RELEASE_ROOT/$(basename "$ARCHIVE_PATH")"
+STAGED_ARCHIVE_NAME="Search-My-Mac-$VERSION.zip"
+ditto "$ARCHIVE_PATH" "$RELEASE_ROOT/$STAGED_ARCHIVE_NAME"
 STAGED_NOTES_PATH="$RELEASE_ROOT/Search My Mac-$VERSION.md"
 if [[ "$NOTES_SOURCE" == "string" ]]; then
   printf '%s\n' "$NOTES" > "$STAGED_NOTES_PATH"
@@ -179,9 +197,13 @@ if ! grep -Fq '<!-- sparkle-signatures:' "$APPCAST_PATH"; then
   exit 1
 fi
 
+STAGED_PACKAGE_NAME="Search-My-Mac.pkg"
+ditto "$PACKAGE_PATH" "$RELEASE_ROOT/$STAGED_PACKAGE_NAME"
+
 GH_ARGUMENTS=(
   release create "$TAG"
-  "$RELEASE_ROOT/$(basename "$ARCHIVE_PATH")"
+  "$RELEASE_ROOT/$STAGED_PACKAGE_NAME#Search My Mac installer (recommended)"
+  "$RELEASE_ROOT/$STAGED_ARCHIVE_NAME"
   "$APPCAST_PATH"
   --repo "$REPOSITORY"
   --target "$COMMIT_SHA"
@@ -192,7 +214,7 @@ if [[ "$DRAFT" == "1" ]]; then
   GH_ARGUMENTS+=(--draft)
 fi
 
-echo "Publishing GitHub Release $TAG…"
+echo "Publishing GitHub Release ${TAG}…"
 gh "${GH_ARGUMENTS[@]}"
 echo "Published https://github.com/$REPOSITORY/releases/tag/$TAG"
 if [[ "$DRAFT" == "1" ]]; then

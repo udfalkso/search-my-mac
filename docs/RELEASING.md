@@ -12,6 +12,12 @@ developer Mac. GitHub hosts the finished artifacts but does not build them.
    gh auth login
    ```
 
+   The repository hosting the releases must be public. Sparkle does not have
+   GitHub credentials and cannot download update assets from a private
+   repository. A private source repository therefore needs a separate public
+   release repository, with both `SUFeedURL` and the publisher configured to
+   use it.
+
 2. Install the Developer ID Application certificate and configure Apple
    notarization as described in the README. The local `.smm-signing.env` must
    include `SMM_TEAM_ID`; signing identities and notarization credentials must
@@ -61,12 +67,20 @@ developer Mac. GitHub hosts the finished artifacts but does not build them.
    Add `--draft` to upload a private draft for inspection. Publishing the draft
    in GitHub makes it the live update feed.
 
-The publisher runs `scripts/notarize-app.sh`, verifies the archive, uses
-Sparkle's pinned `generate_appcast` tool and the private Keychain key to sign the
-archive and feed, then creates `v<version>` with these assets:
+The publisher runs `scripts/notarize-app.sh`, creates and notarizes the Installer
+package, verifies both artifacts, then uses Sparkle's pinned `generate_appcast`
+tool and the private Keychain key to sign the archive and feed. It creates
+`v<version>` with these assets:
 
-- `Search My Mac-<version>.zip`: Developer ID-signed, notarized, and stapled app
+- `Search-My-Mac.pkg`: recommended installer for people downloading the app
+- `Search-My-Mac-<version>.zip`: Developer ID-signed, notarized, and stapled app
 - `appcast.xml`: signed Sparkle feed pointing to that tag's immutable ZIP asset
+
+The latest installer always has this stable download URL:
+
+```text
+https://github.com/udfalkso/search-my-mac/releases/latest/download/Search-My-Mac.pkg
+```
 
 Installed apps check the stable URL below. GitHub redirects it to the appcast
 asset on the latest published, non-prerelease release:
