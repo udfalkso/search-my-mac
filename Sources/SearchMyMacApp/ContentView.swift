@@ -1810,7 +1810,12 @@ private struct ResultsView: View {
     @ViewBuilder
     private func resultContextMenu(_ hit: SearchHit) -> some View {
         Button { model.quickLook(hit) } label: { Label("Quick Look", systemImage: "eye") }
-        Button { model.open(hit) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
+        Button { model.open(hit) } label: {
+            Label(model.opensAtMatch(hit) ? "Open at Match" : "Open", systemImage: "arrow.up.forward.app")
+        }
+        if model.opensAtMatch(hit) {
+            Button { model.openNormally(hit) } label: { Label("Open Normally", systemImage: "doc") }
+        }
         Button { model.reveal(hit) } label: { Label("Reveal in Finder", systemImage: "folder") }
         Button { copyPath(hit.path) } label: { Label("Copy Path", systemImage: "doc.on.doc") }
     }
@@ -1962,7 +1967,7 @@ private struct ResultPreviewPane: View {
             Divider()
 
             HStack(spacing: 8) {
-                Button("Open") { model.open(hit) }
+                Button(model.opensAtMatch(hit) ? "Open at Match" : "Open") { model.open(hit) }
                 Button("Reveal in Finder") { model.reveal(hit) }
                 Spacer()
                 Text("Space for Quick Look")
@@ -2206,7 +2211,9 @@ private struct ResultHoverActions: View {
     var body: some View {
         HStack(spacing: 1) {
             action("Quick Look", symbol: "eye") { model.quickLook(hit) }
-            action("Open", symbol: "arrow.up.forward.app") { model.open(hit) }
+            action(model.opensAtMatch(hit) ? "Open at Match" : "Open", symbol: "arrow.up.forward.app") {
+                model.open(hit)
+            }
             action("Reveal in Finder", symbol: "folder") { model.reveal(hit) }
             action("Copy Path", symbol: "doc.on.doc") {
                 NSPasteboard.general.clearContents()

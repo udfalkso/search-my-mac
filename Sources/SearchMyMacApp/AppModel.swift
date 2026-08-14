@@ -46,6 +46,7 @@ final class AppModel: ObservableObject {
     @Published var isRetryingIndexIssues = false
 
     private let engine: LocalSearchEngine?
+    private let wordMatchNavigator = WordMatchNavigator()
     private var searchTask: Task<Void, Never>?
     /// Changes for every request so an older asynchronous result can never
     /// repaint the UI after a newer query, mode, or filter selection.
@@ -562,7 +563,39 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func open(_ hit: SearchHit) { NSWorkspace.shared.open(hit.url) }
+    func opensAtMatch(_ hit: SearchHit) -> Bool {
+        wordMatchNavigator.canNavigate(hit)
+    }
+
+    func open(_ hit: SearchHit) {
+        let anchors = WordMatchNavigator.searchAnchors(for: hit)
+        guard wordMatchNavigator.canNavigate(hit), !anchors.isEmpty else {
+            openNormally(hit)
+            return
+        }
+        guard wordMatchNavigator.openInWord(hit.url) else {
+            openNormally(hit)
+            return
+        }
+        Task { [weak self] in
+            // Opening Word returns before its document object is necessarily
+            // available. Retry only while that exact file is still loading.
+            for attempt in 0..<12 {
+                try? await Task.sleep(for: .milliseconds(attempt == 0 ? 650 : 250))
+                guard !Task.isCancelled, let self else { return }
+                switch self.wordMatchNavigator.navigate(documentURL: hit.url, anchors: anchors) {
+                case .notReady:
+                    continue
+                case .found, .notFound, .failed:
+                    return
+                }
+            }
+        }
+    }
+
+    func openNormally(_ hit: SearchHit) {
+        NSWorkspace.shared.open(hit.url)
+    }
 
     func quickLook(_ hit: SearchHit) { QuickLookController.shared.show(hit.url) }
 
