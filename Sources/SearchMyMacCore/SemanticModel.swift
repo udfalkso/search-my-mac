@@ -246,7 +246,7 @@ package final class QwenEmbeddingModel: @unchecked Sendable {
 
     private var model: OpaquePointer?
     private var context: OpaquePointer?
-    private let inferenceLock = NSLock()
+    private let inferenceGate = InferenceAccessGate()
     let dimensions: Int
     private let maximumTokens: Int
     private let maximumBatchSequences: Int
@@ -315,21 +315,21 @@ package final class QwenEmbeddingModel: @unchecked Sendable {
     }
 
     package func shutdown() {
-        inferenceLock.lock()
-        defer { inferenceLock.unlock() }
-        if let context {
-            llama_synchronize(context)
-            llama_free(context)
-            self.context = nil
-        }
-        if let model {
-            llama_model_free(model)
-            self.model = nil
+        inferenceGate.withAccess(priority: .foreground) {
+            if let context {
+                llama_synchronize(context)
+                llama_free(context)
+                self.context = nil
+            }
+            if let model {
+                llama_model_free(model)
+                self.model = nil
+            }
         }
     }
 
     package func embedDocument(_ text: String) throws -> [Float] {
-        try embed(text)
+        try embed(text, priority: .background)
     }
 
     /// Embeds independent passages in one llama.cpp decode. This is materially
@@ -341,68 +341,68 @@ package final class QwenEmbeddingModel: @unchecked Sendable {
         guard texts.count <= maximumBatchSequences else {
             throw SearchMyMacError.semantic("Embedding batch exceeds the model context capacity.")
         }
-        inferenceLock.lock()
-        defer { inferenceLock.unlock() }
-        guard let model, let context else { throw SearchMyMacError.semantic("The model is not loaded.") }
-        let vocabulary = llama_model_get_vocab(model)
-        let tokenGroups = try texts.map { try preparedTokens(for: $0, vocabulary: vocabulary) }
-        let tokenCount = tokenGroups.reduce(0) { $0 + $1.count }
-        guard tokenCount <= maximumTokens * maximumBatchSequences else {
-            throw SearchMyMacError.semantic("Embedding batch exceeds the model token capacity.")
-        }
+        return try inferenceGate.withAccess(priority: .background) {
+            guard let model, let context else { throw SearchMyMacError.semantic("The model is not loaded.") }
+            let vocabulary = llama_model_get_vocab(model)
+            let tokenGroups = try texts.map { try preparedTokens(for: $0, vocabulary: vocabulary) }
+            let tokenCount = tokenGroups.reduce(0) { $0 + $1.count }
+            guard tokenCount <= maximumTokens * maximumBatchSequences else {
+                throw SearchMyMacError.semantic("Embedding batch exceeds the model token capacity.")
+            }
 
-        llama_memory_clear(llama_get_memory(context), true)
-        var batch = llama_batch_init(Int32(tokenCount), 0, Int32(texts.count))
-        batch.n_tokens = Int32(tokenCount)
-        defer { llama_batch_free(batch) }
-        var index = 0
-        for (sequence, tokens) in tokenGroups.enumerated() {
-            for (position, token) in tokens.enumerated() {
-                batch.token[index] = token
-                batch.pos[index] = llama_pos(position)
-                batch.n_seq_id[index] = 1
-                batch.seq_id[index]?.pointee = llama_seq_id(sequence)
-                batch.logits[index] = position == tokens.indices.last ? 1 : 0
-                index += 1
+            llama_memory_clear(llama_get_memory(context), true)
+            var batch = llama_batch_init(Int32(tokenCount), 0, Int32(texts.count))
+            batch.n_tokens = Int32(tokenCount)
+            defer { llama_batch_free(batch) }
+            var index = 0
+            for (sequence, tokens) in tokenGroups.enumerated() {
+                for (position, token) in tokens.enumerated() {
+                    batch.token[index] = token
+                    batch.pos[index] = llama_pos(position)
+                    batch.n_seq_id[index] = 1
+                    batch.seq_id[index]?.pointee = llama_seq_id(sequence)
+                    batch.logits[index] = position == tokens.indices.last ? 1 : 0
+                    index += 1
+                }
             }
-        }
-        let decodeResult = llama_decode(context, batch)
-        guard decodeResult == 0 else {
-            throw SearchMyMacError.semantic("Qwen3 batch inference failed with code \(decodeResult).")
-        }
-        return try texts.indices.map { sequence in
-            guard let output = llama_get_embeddings_seq(context, llama_seq_id(sequence)) else {
-                throw SearchMyMacError.semantic("Qwen3 did not return a pooled embedding.")
+            let decodeResult = llama_decode(context, batch)
+            guard decodeResult == 0 else {
+                throw SearchMyMacError.semantic("Qwen3 batch inference failed with code \(decodeResult).")
             }
-            return try normalizedEmbedding(output)
+            return try texts.indices.map { sequence in
+                guard let output = llama_get_embeddings_seq(context, llama_seq_id(sequence)) else {
+                    throw SearchMyMacError.semantic("Qwen3 did not return a pooled embedding.")
+                }
+                return try normalizedEmbedding(output)
+            }
         }
     }
 
     package func embedQuery(_ query: String) throws -> [Float] {
         let instruction = "Instruct: Given a search query, retrieve relevant passages from files on this Mac that answer or relate to the query\nQuery: \(query)"
-        return try embed(instruction)
+        return try embed(instruction, priority: .foreground)
     }
 
-    private func embed(_ text: String) throws -> [Float] {
-        inferenceLock.lock()
-        defer { inferenceLock.unlock() }
-        guard let model, let context else { throw SearchMyMacError.semantic("The model is not loaded.") }
-        let vocab = llama_model_get_vocab(model)
-        // This GGUF declares add_eos_token=true. Asking llama.cpp to add special
-        // tokens supplies the single final token required for last-token pooling.
-        var tokens = try preparedTokens(for: text, vocabulary: vocab)
+    private func embed(_ text: String, priority: InferenceAccessGate.Priority) throws -> [Float] {
+        try inferenceGate.withAccess(priority: priority) {
+            guard let model, let context else { throw SearchMyMacError.semantic("The model is not loaded.") }
+            let vocab = llama_model_get_vocab(model)
+            // This GGUF declares add_eos_token=true. Asking llama.cpp to add special
+            // tokens supplies the single final token required for last-token pooling.
+            var tokens = try preparedTokens(for: text, vocabulary: vocab)
 
-        llama_memory_clear(llama_get_memory(context), true)
-        let decodeResult = tokens.withUnsafeMutableBufferPointer { buffer in
-            llama_decode(context, llama_batch_get_one(buffer.baseAddress, Int32(buffer.count)))
+            llama_memory_clear(llama_get_memory(context), true)
+            let decodeResult = tokens.withUnsafeMutableBufferPointer { buffer in
+                llama_decode(context, llama_batch_get_one(buffer.baseAddress, Int32(buffer.count)))
+            }
+            guard decodeResult == 0 else {
+                throw SearchMyMacError.semantic("Qwen3 inference failed with code \(decodeResult).")
+            }
+            guard let output = llama_get_embeddings_seq(context, 0) else {
+                throw SearchMyMacError.semantic("Qwen3 did not return a pooled embedding.")
+            }
+            return try normalizedEmbedding(output)
         }
-        guard decodeResult == 0 else {
-            throw SearchMyMacError.semantic("Qwen3 inference failed with code \(decodeResult).")
-        }
-        guard let output = llama_get_embeddings_seq(context, 0) else {
-            throw SearchMyMacError.semantic("Qwen3 did not return a pooled embedding.")
-        }
-        return try normalizedEmbedding(output)
     }
 
     private func preparedTokens(for text: String, vocabulary: OpaquePointer?) throws -> [llama_token] {
@@ -442,6 +442,46 @@ package final class QwenEmbeddingModel: @unchecked Sendable {
         guard written >= 0 else { throw SearchMyMacError.semantic("The text could not be tokenized.") }
         if Int(written) < tokens.count { tokens.removeLast(tokens.count - Int(written)) }
         return tokens
+    }
+}
+
+/// Serializes access to a llama.cpp context while allowing an interactive
+/// query to pass queued background indexing work at the next inference
+/// boundary. `TaskPriority` alone cannot provide this ordering because model
+/// inference is synchronous and guarded outside Swift's cooperative executor.
+final class InferenceAccessGate: @unchecked Sendable {
+    enum Priority: Sendable {
+        case foreground
+        case background
+    }
+
+    private let condition = NSCondition()
+    private var isActive = false
+    private var waitingForegroundCount = 0
+
+    var hasWaitingForeground: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return waitingForegroundCount > 0
+    }
+
+    func withAccess<T>(priority: Priority, _ operation: () throws -> T) rethrows -> T {
+        condition.lock()
+        if priority == .foreground { waitingForegroundCount += 1 }
+        while isActive || (priority == .background && waitingForegroundCount > 0) {
+            condition.wait()
+        }
+        if priority == .foreground { waitingForegroundCount -= 1 }
+        isActive = true
+        condition.unlock()
+
+        defer {
+            condition.lock()
+            isActive = false
+            condition.broadcast()
+            condition.unlock()
+        }
+        return try operation()
     }
 }
 

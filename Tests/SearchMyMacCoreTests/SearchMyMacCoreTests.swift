@@ -39,6 +39,42 @@ import Testing
     #expect(idle.interBatchDelay == .zero)
 }
 
+@Test func inferenceAccessGateLetsForegroundPassQueuedBackgroundWork() {
+    let gate = InferenceAccessGate()
+    let firstBackgroundStarted = DispatchSemaphore(value: 0)
+    let releaseFirstBackground = DispatchSemaphore(value: 0)
+    let foregroundCompleted = DispatchSemaphore(value: 0)
+    let secondBackgroundObservedForeground = DispatchSemaphore(value: 0)
+    let secondBackgroundCompleted = DispatchSemaphore(value: 0)
+
+    DispatchQueue.global().async {
+        gate.withAccess(priority: .background) {
+            _ = firstBackgroundStarted.signal()
+            releaseFirstBackground.wait()
+        }
+    }
+    firstBackgroundStarted.wait()
+
+    DispatchQueue.global().async {
+        gate.withAccess(priority: .background) {
+            if foregroundCompleted.wait(timeout: .now()) == .success {
+                _ = secondBackgroundObservedForeground.signal()
+            }
+        }
+        _ = secondBackgroundCompleted.signal()
+    }
+    DispatchQueue.global().async {
+        gate.withAccess(priority: .foreground) {
+            _ = foregroundCompleted.signal()
+        }
+    }
+    while !gate.hasWaitingForeground { Thread.sleep(forTimeInterval: 0.001) }
+    _ = releaseFirstBackground.signal()
+
+    #expect(secondBackgroundCompleted.wait(timeout: .now() + 1) == .success)
+    #expect(secondBackgroundObservedForeground.wait(timeout: .now()) == .success)
+}
+
 @Test func startupReconciliationWaitsUntilTheStoredIntervalExpires() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent("searchmymac-reconciliation-schedule-test-\(UUID().uuidString)")
