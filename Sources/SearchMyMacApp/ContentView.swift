@@ -819,7 +819,8 @@ private struct SidebarView: View {
         .frame(minWidth: 220)
         .background {
             SearchMyMacTheme.sidebarWash(for: colorScheme)
-                .ignoresSafeArea()
+                .padding(.top, 8)
+                .ignoresSafeArea(edges: [.horizontal, .bottom])
         }
         .confirmationDialog(
             "Clear Search History?",
