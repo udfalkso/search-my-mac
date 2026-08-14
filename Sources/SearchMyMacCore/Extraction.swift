@@ -68,8 +68,9 @@ struct VisionOCRTextRecognizer: OCRTextRecognizing {
 public struct DocumentExtractor: Sendable {
     public static let supportedExtensions: Set<String> = [
         "txt", "text", "md", "markdown", "csv", "tsv", "json", "jsonl", "xml", "yaml", "yml",
-        "toml", "ini", "conf", "cfg", "log", "rtf", "rtfd", "html", "htm", "doc", "docx", "odt",
-        "pdf", "pages", "numbers", "key", "ppt", "pptx", "odp", "xls", "xlsx", "xlsb", "ods",
+        "toml", "ini", "conf", "cfg", "log", "rtf", "rtfd", "html", "htm", "doc", "docx", "docm", "odt",
+        "pdf", "pages", "numbers", "key", "ppt", "pps", "pot", "pptx", "pptm", "ppsx", "ppsm", "odp",
+        "xls", "xlsx", "xlsm", "xlsb", "ods",
         "epub", "eml", "emlx", "swift", "m", "mm", "h", "hpp", "c", "cc", "cpp", "rs", "go",
         "py", "rb", "js", "jsx", "ts", "tsx", "java", "kt", "kts", "sh", "bash", "zsh", "fish",
         "sql", "css", "scss", "less", "tex",
@@ -78,25 +79,46 @@ public struct DocumentExtractor: Sendable {
     public static let imageExtensions: Set<String> = [
         "jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "bmp", "gif", "webp"
     ]
+    static let structuredDocumentExtensions: Set<String> = [
+        "doc", "docx", "docm", "odt", "rtf",
+        "ppt", "pps", "pot", "pptx", "pptm", "ppsx", "ppsm", "odp",
+        "xls", "xlsx", "xlsm", "xlsb", "ods", "epub"
+    ]
+    /// Increment only the formats whose extraction output materially changes.
+    /// Persisting this per file makes parser upgrades a targeted, one-time
+    /// re-extraction instead of requiring users to rebuild the entire index.
+    static let extractionRecipeVersions: [String: Int] = {
+        var versions = Dictionary(uniqueKeysWithValues: structuredDocumentExtensions.map { ($0, 1) })
+        versions["pdf"] = 1
+        return versions
+    }()
+
+    static func extractionRecipeVersion(forExtension fileExtension: String) -> Int {
+        extractionRecipeVersions[fileExtension.lowercased(), default: 0]
+    }
 
     private let limits: ExtractionLimits
     private let chunker: PassageChunker
     private let textRecognizer: any OCRTextRecognizing
+    private let localDocumentParser: (any LocalDocumentParsing)?
 
     public init(limits: ExtractionLimits = .init(), chunker: PassageChunker = .init()) {
         self.limits = limits
         self.chunker = chunker
         textRecognizer = VisionOCRTextRecognizer()
+        localDocumentParser = AnydocExtractorBridge()
     }
 
     init(
         limits: ExtractionLimits = .init(),
         chunker: PassageChunker = .init(),
-        textRecognizer: any OCRTextRecognizing
+        textRecognizer: any OCRTextRecognizing,
+        localDocumentParser: (any LocalDocumentParsing)? = AnydocExtractorBridge()
     ) {
         self.limits = limits
         self.chunker = chunker
         self.textRecognizer = textRecognizer
+        self.localDocumentParser = localDocumentParser
     }
 
     public func extract(_ file: DiscoveredFile) async -> ExtractedDocument? {
@@ -113,9 +135,11 @@ public struct DocumentExtractor: Sendable {
                 return try await extractPDF(file.url)
             case _ where Self.imageExtensions.contains(ext):
                 return try await extractImage(file.url)
-            case "rtf", "rtfd", "doc", "docx", "odt", "html", "htm":
+            case _ where Self.structuredDocumentExtensions.contains(ext):
+                return try await extractStructuredDocument(file.url, extension: ext)
+            case "rtfd", "html", "htm":
                 return try extractAttributedDocument(file.url, extension: ext)
-            case "pages", "numbers", "key", "ppt", "pptx", "odp", "xls", "xlsx", "xlsb", "ods", "epub":
+            case "pages", "numbers", "key":
                 return try await extractWithMetadataImporter(file.url)
             default:
                 let data = try Data(contentsOf: file.url, options: [.mappedIfSafe])
@@ -135,12 +159,29 @@ public struct DocumentExtractor: Sendable {
         if document.isLocked, !document.unlock(withPassword: "") {
             return ExtractedDocument(passages: [], availability: .contentLocked, error: "Password-protected PDF")
         }
+        var structuredPages: [Int: StructuredPDFPage] = [:]
+        if let localDocumentParser,
+           let fileSize = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+           Int64(fileSize) <= limits.maximumSourceBytes,
+           let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+           let pages = try? localDocumentParser.extractPDF(data: data) {
+            for page in pages {
+                structuredPages[page.pageIndex] = page
+            }
+        }
         var passages: [ExtractedPassage] = []
         var ordinal = 0
         for pageIndex in 0..<document.pageCount {
             if Task.isCancelled { throw SearchMyMacError.cancelled }
             guard let page = document.page(at: pageIndex) else { continue }
-            var text = page.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let structuredPage = structuredPages[pageIndex]
+            var text: String
+            if let structuredPage, !structuredPage.needsOCR,
+               !structuredPage.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                text = structuredPage.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                text = page.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            }
             if text.count < 32, pageIndex < limits.maximumOCRPages, hasMeaningfulInk(page) {
                 text = try await recognizeText(on: page)
             }
@@ -161,6 +202,38 @@ public struct DocumentExtractor: Sendable {
             passages: passages,
             availability: passages.isEmpty ? .filenameOnly : .available
         )
+    }
+
+    private func extractStructuredDocument(_ url: URL, extension ext: String) async throws -> ExtractedDocument {
+        guard let localDocumentParser else {
+            return try await extractWithCompatibilityImporter(url, extension: ext)
+        }
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        do {
+            let text = try localDocumentParser.extractDocument(data: data, fileExtension: ext)
+            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return try await extractWithCompatibilityImporter(url, extension: ext)
+            }
+            return makeDocument(text: text, title: url.deletingPathExtension().lastPathComponent)
+        } catch let error as LocalDocumentParserError {
+            switch error.code {
+            case .encrypted:
+                return ExtractedDocument(passages: [], availability: .contentLocked, error: "Password-protected document")
+            case .resourceLimit, .panic:
+                throw SearchMyMacError.extraction(error.localizedDescription)
+            default:
+                return try await extractWithCompatibilityImporter(url, extension: ext)
+            }
+        }
+    }
+
+    private func extractWithCompatibilityImporter(_ url: URL, extension ext: String) async throws -> ExtractedDocument {
+        switch ext {
+        case "rtf", "doc", "docx", "docm", "odt":
+            return try extractAttributedDocument(url, extension: ext)
+        default:
+            return try await extractWithMetadataImporter(url)
+        }
     }
 
     private func extractImage(_ url: URL) async throws -> ExtractedDocument {
@@ -204,7 +277,7 @@ public struct DocumentExtractor: Sendable {
         case "rtf": .rtf
         case "rtfd": .rtfd
         case "doc": .docFormat
-        case "docx": .officeOpenXML
+        case "docx", "docm": .officeOpenXML
         case "odt": .openDocument
         case "html", "htm": .html
         default: .plain

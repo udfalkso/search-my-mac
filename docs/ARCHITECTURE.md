@@ -8,6 +8,18 @@ The bundled engine XPC service is app-sandboxed and exports only a small data pr
 
 The current development data path remains in-process, but lexical queries use the bundled Tantivy engine whenever its commit payload matches SQLite's authoritative generation. SQLite records the latest pending operation per source; crashes before or after a Tantivy commit are repaired idempotently from that journal, and FTS5 remains available during initial rebuild or repair. The XPC bundle is assembled now so signing, sandboxing, and ABI failures are caught early; moving this completed data path behind authenticated XPC remains a release gate.
 
+Document extraction prefers a separate bytes-only Rust adapter built on pinned
+`anydoc` and `pdf-inspector` releases. The adapter receives no paths and returns
+bounded plain text or page-aware PDF text plus OCR-routing hints. Office,
+OpenDocument, RTF, and EPUB containers use the structured adapter, with system
+readers retained as compatibility fallbacks. PDFs use its layout-aware text for
+pages that pass encoding and content-quality checks; PDFKit and local Vision OCR
+remain the fallback for flagged, vector-text, image-heavy, or scanned pages.
+Pages, Numbers, and Keynote continue through the system metadata importer. The
+resident app still performs this work in-process during development; moving the
+same byte interface into the planned file-handle-only extractor XPC boundary is
+a release gate.
+
 The signed app also bundles the `smm` command-line client. The installer exposes it
 at `/usr/local/bin/smm` with a symlink back into the application bundle, so the CLI
 and app cannot drift onto different engine versions. CLI sessions open SQLite and
@@ -19,9 +31,18 @@ automation sandboxes do not consistently permit Metal command queues.
 
 ## Durable state
 
-SQLite is authoritative. It stores roots, file identity and availability, desired/applied generations, passages, history, saved searches, staged discovery manifests, and FSEvents positions. FTS and vectors are derived and replaceable.
+SQLite is authoritative. It stores roots, file identity and availability, extraction recipe versions, desired/applied generations, passages, history, saved searches, staged discovery manifests, and FSEvents positions. FTS and vectors are derived and replaceable.
 
 Initial discovery writes prioritized bounded batches to `scan_items`, while a consumer immediately extracts and indexes unprocessed staged rows. The discovery-phase progress bar measures the share of files found so far that have already been indexed; because the denominator is still growing, it is explicitly labeled “live.” Once enumeration completes, the denominator freezes and the percentage becomes exact. Deletion reconciliation still happens only after a successful complete scan of an available root. A cancelled or failed scan discards its staging generation and does not infer deletion.
+
+Each file records the extraction recipe version that last attempted it. A parser
+change increments only the affected extensions. On the first launch after an
+upgrade, stale recipes make startup reconciliation immediately due; discovery
+still skips every unchanged file whose recipe is current. Successful legacy
+content and legacy failures are both retried once because either may benefit
+from a new parser. The new version is recorded even when the new attempt fails,
+so automatic migration cannot become an infinite retry loop; failures remain
+available through the explicit retry control.
 
 The semantic pipeline uses the official Qwen3 Embedding 0.6B Q8 GGUF through a pinned universal llama.cpp framework. The app validates the optional model download by exact size and SHA-256 before loading it. Documents are embedded without an instruction; queries use Qwen's retrieval instruction format. Both outputs are normalized 1024-dimensional vectors.
 
@@ -42,7 +63,7 @@ Pagination cursors carry the manifest generation and fail cleanly when stale. Hi
 
 ## Filesystem recovery
 
-FSEvents is treated as a hint. `MustScanSubDirs`, user/kernel drops, event-ID wrapping, and root changes trigger reconciliation. A normal file event re-extracts only that source after before/after identity checks. Directory events trigger a scoped-via-root reconciliation in v0.1. Existing roots reconcile at launch, daily, and after wake; unchanged sources skip extraction.
+FSEvents is treated as a hint. `MustScanSubDirs`, user/kernel drops, event-ID wrapping, and root changes trigger reconciliation. A normal file event re-extracts only that source after before/after identity checks. Directory events trigger a scoped-via-root reconciliation in v0.1. Existing roots reconcile at launch when due or when an extraction recipe changed, daily, and after wake; unchanged sources with current recipes skip extraction.
 
 External roots that cannot be reached are marked offline. Their records are retained. Records are removed only after an available root is fully reconciled or the user removes that root.
 

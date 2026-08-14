@@ -1126,9 +1126,12 @@ private struct SearchFiltersPopover: View {
 
     private let documentTypes = [
         FileTypeFilterOption(label: "PDF", extensions: ["pdf"]),
-        FileTypeFilterOption(label: "DOC / DOCX", extensions: ["doc", "docx"]),
-        FileTypeFilterOption(label: "XLS / XLSX", extensions: ["xls", "xlsx"]),
-        FileTypeFilterOption(label: "PPT / PPTX", extensions: ["ppt", "pptx"]),
+        FileTypeFilterOption(label: "DOC / DOCX", extensions: ["doc", "docx", "docm"]),
+        FileTypeFilterOption(label: "XLS / XLSX", extensions: ["xls", "xlsx", "xlsm", "xlsb"]),
+        FileTypeFilterOption(
+            label: "PPT / PPTX",
+            extensions: ["ppt", "pps", "pot", "pptx", "pptm", "ppsx", "ppsm"]
+        ),
         FileTypeFilterOption(label: "MD", extensions: ["md"]),
         FileTypeFilterOption(label: "TXT", extensions: ["txt"])
     ]

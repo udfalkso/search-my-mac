@@ -411,8 +411,8 @@ actor ManifestStore {
                 """
                 INSERT INTO files(
                     source_id, root_id, path, filename, extension, modified_at, size,
-                    availability, desired_generation, applied_generation, error
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    availability, desired_generation, applied_generation, error, extraction_version
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_id) DO UPDATE SET
                     root_id = excluded.root_id,
                     path = excluded.path,
@@ -423,7 +423,8 @@ actor ManifestStore {
                     availability = excluded.availability,
                     desired_generation = excluded.desired_generation,
                     applied_generation = excluded.applied_generation,
-                    error = excluded.error
+                    error = excluded.error,
+                    extraction_version = excluded.extraction_version
                 """,
                 bindings: [
                     .text(file.sourceID), .text(file.rootID), .text(file.url.path),
@@ -431,7 +432,8 @@ actor ManifestStore {
                     file.modifiedAt.map { .real($0.timeIntervalSince1970) } ?? .null,
                     .integer(file.size), .text(availability.rawValue),
                     .integer(nextGeneration), .integer(nextGeneration),
-                    document?.error.map(SQLiteValue.text) ?? .null
+                    document?.error.map(SQLiteValue.text) ?? .null,
+                    .integer(Int64(DocumentExtractor.extractionRecipeVersion(forExtension: file.url.pathExtension)))
                 ]
             )
 
@@ -468,9 +470,15 @@ actor ManifestStore {
 
     func needsExtraction(_ file: DiscoveredFile) throws -> Bool {
         guard let row = try database.query(
-            "SELECT path, modified_at, size, availability FROM files WHERE source_id = ?",
+            "SELECT path, modified_at, size, availability, extraction_version FROM files WHERE source_id = ?",
             bindings: [.text(file.sourceID)]
         ).first else { return true }
+        let requiredExtractionVersion = DocumentExtractor.extractionRecipeVersion(
+            forExtension: file.url.pathExtension
+        )
+        if Int(row["extraction_version"]?.int64 ?? 0) < requiredExtractionVersion {
+            return true
+        }
         guard row["path"]?.string == file.url.path,
               row["size"]?.int64 == file.size else { return true }
         let oldModified = row["modified_at"]?.double
@@ -478,6 +486,28 @@ actor ManifestStore {
         if oldModified == nil && newModified == nil { return false }
         guard let oldModified, let newModified else { return true }
         return abs(oldModified - newModified) > 0.000_001
+    }
+
+    func hasOutdatedExtractions() throws -> Bool {
+        let versions = DocumentExtractor.extractionRecipeVersions
+        guard !versions.isEmpty else { return false }
+        let extensions = versions.keys.sorted()
+        let extensionPlaceholders = Array(repeating: "?", count: extensions.count).joined(separator: ", ")
+        let rows = try database.query(
+            """
+            SELECT DISTINCT f.extension, f.extraction_version
+            FROM files f
+            JOIN roots r ON r.id = f.root_id
+            WHERE r.enabled = 1 AND r.available = 1
+              AND f.extension IN (\(extensionPlaceholders))
+            """,
+            bindings: extensions.map(SQLiteValue.text)
+        )
+        return rows.contains { row in
+            guard let fileExtension = row["extension"]?.string,
+                  let requiredVersion = versions[fileExtension] else { return false }
+            return Int(row["extraction_version"]?.int64 ?? 0) < requiredVersion
+        }
     }
 
     func search(_ request: SearchRequest, recordInHistory: Bool = true) throws -> SearchResponse {
@@ -1244,10 +1274,12 @@ actor ManifestStore {
                 availability TEXT NOT NULL,
                 desired_generation INTEGER NOT NULL,
                 applied_generation INTEGER NOT NULL,
-                error TEXT
+                error TEXT,
+                extraction_version INTEGER NOT NULL DEFAULT 0
             )
             """
         )
+        try? database.execute("ALTER TABLE files ADD COLUMN extraction_version INTEGER NOT NULL DEFAULT 0")
         try database.execute("CREATE INDEX IF NOT EXISTS files_root_idx ON files(root_id)")
         try database.execute("CREATE INDEX IF NOT EXISTS files_path_idx ON files(path)")
         try database.execute(

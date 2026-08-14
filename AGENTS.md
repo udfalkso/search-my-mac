@@ -16,6 +16,7 @@ The main app remains resident after its windows close. It owns filesystem/TCC ac
 - `Sources/SearchMyMacEngineService/`: bundled authenticated engine XPC service.
 - `Tests/SearchMyMacCoreTests/`: Swift Testing coverage for indexing, queries, migrations, vectors, XPC, history, and discovery policy.
 - `rust-engine/`: Tantivy Rust `cdylib` and C ABI. Tantivy is the active lexical path once its committed generation matches SQLite; FTS5 is the repair-time fallback.
+- `rust-extractor/`: bytes-only Rust `cdylib` using anydoc/pdf-inspector for structured office documents and page-aware PDFs; it never receives filesystem paths.
 - `Resources/`: app/XPC plists and development/distribution entitlements.
 - `scripts/build-app.sh`: Swift/Rust build, `.app` assembly, and inside-out signing.
 - `docs/ARCHITECTURE.md`: architecture and durability decisions.
@@ -44,6 +45,9 @@ CLANG_MODULE_CACHE_PATH=.build/clang-cache swift test \
 
 # Test the Rust/Tantivy engine
 cargo test --manifest-path rust-engine/Cargo.toml
+
+# Test the Rust document extractor
+cargo test --manifest-path rust-extractor/Cargo.toml
 
 # Verify the assembled signature
 codesign --verify --deep --strict --verbose=2 ".build/Search My Mac.app"
@@ -94,6 +98,11 @@ If `open` fails with `RBSRequestErrorDomain Code=5`, `NSPOSIXErrorDomain Code=16
 - Policy-excluded records are safe to remove even during an otherwise incomplete reconciliation; this cleans records created under older policies.
 - Increment `DiscoveryPolicy.version` whenever exclusion behavior changes. On the next reconciliation, each root incrementally purges records admitted by an older policy before starting filesystem discovery.
 - Check file identity before and after extraction. Discard and requeue unstable results.
+- Persist an extraction recipe version per file. When parser output changes,
+  increment only the affected extensions so startup reconciliation re-extracts
+  them once. Record the new version even for a completed failed attempt; use
+  the explicit failure retry action for subsequent attempts rather than
+  creating an automatic retry loop.
 - Do not follow symlinks or recurse into packages, arbitrary archives, attachments, or app internals.
 - Common standalone image formats are content-bearing files. Extract their visible text locally with Vision OCR using bounded, downsampled images; never upload image content.
 

@@ -92,7 +92,13 @@ final class AppModel: ObservableObject {
                 }
             }
             catch { errorMessage = error.localizedDescription }
-            do { try await engine?.startMonitoring() }
+            do {
+                try await engine?.startMonitoring()
+                if let engine,
+                   try await engine.startupReconciliationIsDue(maximumAge: 86_400) {
+                    await reconcileRoots()
+                }
+            }
             catch { errorMessage = error.localizedDescription }
         }
         NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)

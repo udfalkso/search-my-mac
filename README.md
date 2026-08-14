@@ -30,8 +30,8 @@ hardening and scale work is tracked in
 - Resident main-app lifecycle, optional login launch through `SMAppService.mainApp`, and a Command-Option-Space global shortcut.
 - Durable SQLite manifest and journal state with WAL, owner-only storage, FTS5 lexical fallback, generation-bound cursors, BM25 field weights, UTF-16 highlight ranges, and up to three passages per source result.
 - Pipelined, bounded discovery that stages prioritized 256-file batches in SQLite instead of retaining an entire million-file manifest in memory. Recent supported documents begin indexing while the filesystem walk is still running. The compact status bar uses an activity spinner and exposes checked/found/waiting counts, current work, indexing rate, and pause/resume controls in its details popover.
-- Change detection using per-file FSEvents. Dropped events, wrapped IDs, changed roots, and `MustScanSubDirs` force reconciliation. Unchanged files are not re-extracted; unavailable roots are marked offline rather than deleted.
-- PDFKit extraction by page; conservative scanned-page and standalone-image OCR with Vision; Foundation readers for RTF, Word, OpenDocument text, and HTML; direct ingestion for plain text and structured text; and system metadata-importer compatibility for iWork, spreadsheet, presentation, and EPUB containers while native structured adapters are completed.
+- Change detection using per-file FSEvents and persisted extraction recipe versions. Dropped events, wrapped IDs, changed roots, `MustScanSubDirs`, and parser upgrades force reconciliation. A parser upgrade re-extracts only affected formats once; otherwise unchanged files are skipped. Unavailable roots are marked offline rather than deleted.
+- Local Rust extraction for Word, PowerPoint, Excel, OpenDocument, RTF, and EPUB with table/list/note structure preserved as searchable text; layout-aware PDF extraction with per-page PDFKit and Vision fallbacks for encoding, vector-text, and scanned-page cases; Foundation readers for HTML and RTFD; direct ingestion for plain/structured text; and system metadata-importer compatibility for iWork.
 - Before/after size and modification checks, extraction size limits, cancellation, parser timeouts, placeholder states, low-disk pauses, package skipping, symlink avoidance, and hard-link identity deduplication.
 - High-confidence user-content discovery defaults prune source-code files plus dependency and generated trees such as `node_modules`, Go's module cache, Python environments, CocoaPods, Carthage, SwiftPM output, and Xcode DerivedData. Entire Home scans avoid managed `~/Library` content except iCloud Drive and cloud-provider document roots; explicitly choosing an excluded folder opts that root back in.
 - An active Rust `cdylib` using Tantivy 0.26 with versioned field boosts, source grouping, coverage/proximity reranking, three-passage scoring, generation commits, C ABI ownership rules, and integration tests.
@@ -52,6 +52,7 @@ CLANG_MODULE_CACHE_PATH=.build/clang-cache swift test \
   --security-path .build/security
 
 cargo test --manifest-path rust-engine/Cargo.toml
+cargo test --manifest-path rust-extractor/Cargo.toml
 ```
 
 Assemble a runnable development app. The build uses the configured signing
@@ -137,6 +138,7 @@ automation sandboxes that do not permit Metal access.
 - `Sources/SearchMyMacCore`: manifest, discovery, extraction, monitoring, search contracts, XPC client, and vector durability.
 - `Sources/SearchMyMacEngineService`: authenticated private engine XPC listener.
 - `rust-engine`: Tantivy engine and C ABI.
+- `rust-extractor`: bytes-only anydoc/pdf-inspector adapter and C ABI.
 - `Resources`: bundle metadata and signing entitlements.
 - `scripts/build-app.sh`: Swift/Rust build, bundle assembly, and inside-out code signing.
 - `scripts/build-installer.sh`: unsigned or locally signed development package assembly.
@@ -145,6 +147,7 @@ automation sandboxes that do not permit Metal access.
 - `scripts/set-version.sh`: keeps app and XPC version/build metadata in sync.
 - `scripts/publish-release.sh`: local notarized GitHub Release and signed Sparkle appcast publisher.
 - `docs/ARCHITECTURE.md`: ownership, durability, security boundaries, and recovery rules.
+- `docs/EXTRACTION_BAKEOFF.md`: fixture evidence and routing decisions for the Rust document parsers.
 - `docs/CLI_REFERENCE.md`: complete `smm` contract and safe automation guidance.
 - `docs/RELEASING.md`: local versioning, GitHub publishing, and in-app update procedure.
 - `docs/RELEASE_GATES.md`: work that must pass before a public release.
@@ -156,8 +159,9 @@ release artifacts, but it is not yet a public-release-ready product. Tantivy is
 the active in-process lexical backend whenever its durable generation matches
 SQLite; SQLite FTS5 keeps search available while Tantivy is initially built or
 repaired. The authenticated XPC path is built and tested independently but still
-needs to become the production process boundary. Native OOXML/Calamine adapters,
-a file-handle-only extractor XPC service, provider-specific cloud tests, judged
+needs to become the production process boundary. Moving the bytes-only Rust
+adapters behind a file-handle-only extractor XPC service, provider-specific
+cloud tests, judged
 relevance tuning, and the full million-record performance corpus remain
 release-gate work.
 

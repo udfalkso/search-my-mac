@@ -88,6 +88,80 @@ import Testing
     #expect(!(try await store.reconciliationIsDue(rootID: root.id, maximumAge: 86_400)))
 }
 
+@Test func parserUpgradeReextractsOnlyAffectedFormatsOnce() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("searchmymac-extraction-version-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let databaseURL = directory.appendingPathComponent("manifest.sqlite3")
+    let store = try ManifestStore(databaseURL: databaseURL)
+    let root = IndexRoot(id: "fixture", url: directory)
+    try await store.addRoot(root)
+
+    let modifiedAt = Date(timeIntervalSince1970: 1_700_000_000)
+    func file(_ sourceID: String, _ name: String) -> DiscoveredFile {
+        DiscoveredFile(
+            sourceID: sourceID,
+            rootID: root.id,
+            url: directory.appendingPathComponent(name),
+            modifiedAt: modifiedAt,
+            size: 100,
+            availability: .available
+        )
+    }
+    let word = file("word", "Report.docx")
+    let failedSheet = file("sheet", "Broken.ods")
+    let pdf = file("pdf", "Layout.pdf")
+    let text = file("text", "Notes.txt")
+    let successfulDocument = ExtractedDocument(passages: [
+        ExtractedPassage(text: "Previously indexed text", ordinal: 0, locationKind: .section, locationLabel: nil)
+    ])
+    let failedDocument = ExtractedDocument(
+        passages: [],
+        availability: .extractionFailed,
+        error: "The previous extractor failed"
+    )
+    for candidate in [word, pdf, text] {
+        try await store.upsert(file: candidate, document: successfulDocument)
+    }
+    try await store.upsert(file: failedSheet, document: failedDocument)
+
+    // Simulate records written before extraction recipes were versioned.
+    let database = try SQLiteDatabase(url: databaseURL)
+    try database.execute("UPDATE files SET extraction_version = 0")
+    try await store.markRootReconciled(rootID: root.id)
+    let engine = try LocalSearchEngine(storageURL: directory)
+
+    #expect(try await store.needsExtraction(word))
+    #expect(try await store.needsExtraction(failedSheet))
+    #expect(try await store.needsExtraction(pdf))
+    #expect(!(try await store.needsExtraction(text)))
+    #expect(try await store.hasOutdatedExtractions())
+    #expect(try await engine.startupReconciliationIsDue(maximumAge: .greatestFiniteMagnitude))
+
+    try await store.upsert(file: word, document: successfulDocument)
+    try await store.upsert(file: failedSheet, document: failedDocument)
+    try await store.upsert(file: pdf, document: successfulDocument)
+
+    #expect(!(try await store.needsExtraction(word)))
+    #expect(!(try await store.needsExtraction(failedSheet)))
+    #expect(!(try await store.needsExtraction(pdf)))
+    #expect(!(try await store.hasOutdatedExtractions()))
+    #expect(!(try await engine.startupReconciliationIsDue(maximumAge: .greatestFiniteMagnitude)))
+    let versions = try database.query(
+        "SELECT source_id, extraction_version FROM files ORDER BY source_id"
+    )
+    let versionsBySource: [String: Int64] = Dictionary(uniqueKeysWithValues: versions.compactMap { row -> (String, Int64)? in
+        guard let sourceID = row["source_id"]?.string,
+              let version = row["extraction_version"]?.int64 else { return nil }
+        return (sourceID, version)
+    })
+    #expect(versionsBySource["word"] == 1)
+    #expect(versionsBySource["sheet"] == 1)
+    #expect(versionsBySource["pdf"] == 1)
+    #expect(versionsBySource["text"] == 0)
+    await engine.shutdown()
+}
+
 @Test func extractionFailuresAreExposedAsActionableIndexIssues() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent("searchmymac-index-issue-test-\(UUID().uuidString)")
@@ -205,6 +279,151 @@ import Testing
 private struct StubOCRTextRecognizer: OCRTextRecognizing {
     func recognizeText(in image: CGImage) async throws -> String {
         "VISION SEARCH NOTICE"
+    }
+}
+
+@Test func structuredDocumentParserSuppliesOfficeContent() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("searchmymac-anydoc-office-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let url = directory.appendingPathComponent("quarterly.pptx")
+    let data = Data("not a real presentation".utf8)
+    try data.write(to: url)
+    let parser = StubLocalDocumentParser(
+        documentResult: .success("Quarterly Results\n\nRegion\tRevenue\nNorth\t42"),
+        PDFResult: .success([])
+    )
+    let extractor = DocumentExtractor(
+        textRecognizer: StubOCRTextRecognizer(), localDocumentParser: parser
+    )
+
+    let document = await extractor.extract(DiscoveredFile(
+        sourceID: "slides", rootID: "fixture", url: url, modifiedAt: nil,
+        size: Int64(data.count), availability: .available
+    ))
+
+    #expect(document?.availability == .available)
+    #expect(document?.passages.map(\.text).joined(separator: " ").contains("Region Revenue North 42") == true)
+    #expect(document?.title == "quarterly")
+}
+
+@Test func structuredDocumentResourceLimitDoesNotBypassTheSafeParser() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("searchmymac-anydoc-limit-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let url = directory.appendingPathComponent("oversized.docx")
+    let data = Data("container".utf8)
+    try data.write(to: url)
+    let parser = StubLocalDocumentParser(
+        documentResult: .failure(LocalDocumentParserError(
+            code: .resourceLimit, message: "archive expansion limit exceeded"
+        )),
+        PDFResult: .success([])
+    )
+    let extractor = DocumentExtractor(
+        textRecognizer: StubOCRTextRecognizer(), localDocumentParser: parser
+    )
+
+    let document = await extractor.extract(DiscoveredFile(
+        sourceID: "limited", rootID: "fixture", url: url, modifiedAt: nil,
+        size: Int64(data.count), availability: .available
+    ))
+
+    #expect(document?.availability == .extractionFailed)
+    #expect(document?.error?.contains("archive expansion limit exceeded") == true)
+}
+
+@MainActor
+@Test func structuredPDFPagesTakePriorityWhileRetainingPageLabels() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("searchmymac-pdf-structure-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let url = directory.appendingPathComponent("table.pdf")
+    let view = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 300))
+    let data = view.dataWithPDF(inside: view.bounds)
+    try data.write(to: url)
+    let parser = StubLocalDocumentParser(
+        documentResult: .success(""),
+        PDFResult: .success([
+            StructuredPDFPage(
+                pageIndex: 0,
+                text: "Region Revenue North 42 structured table content",
+                needsOCR: false
+            )
+        ])
+    )
+    let extractor = DocumentExtractor(
+        textRecognizer: StubOCRTextRecognizer(), localDocumentParser: parser
+    )
+
+    let document = await extractor.extract(DiscoveredFile(
+        sourceID: "pdf", rootID: "fixture", url: url, modifiedAt: nil,
+        size: Int64(data.count), availability: .available
+    ))
+
+    #expect(document?.passages.first?.text.contains("structured table") == true)
+    #expect(document?.passages.first?.locationKind == .page)
+    #expect(document?.passages.first?.locationLabel == "Page 1")
+}
+
+@MainActor
+@Test func PDFPagesFlaggedForOCRCanStillUseValidPDFKitText() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("searchmymac-pdf-fallback-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let url = directory.appendingPathComponent("encoded.pdf")
+    let view = PDFTextFixtureView(frame: NSRect(x: 0, y: 0, width: 500, height: 300))
+    let data = view.dataWithPDF(inside: view.bounds)
+    try data.write(to: url)
+    let parser = StubLocalDocumentParser(
+        documentResult: .success(""),
+        PDFResult: .success([
+            StructuredPDFPage(pageIndex: 0, text: "", needsOCR: true)
+        ])
+    )
+    let extractor = DocumentExtractor(
+        textRecognizer: StubOCRTextRecognizer(), localDocumentParser: parser
+    )
+
+    let document = await extractor.extract(DiscoveredFile(
+        sourceID: "pdf-fallback", rootID: "fixture", url: url, modifiedAt: nil,
+        size: Int64(data.count), availability: .available
+    ))
+    let text = document?.passages.map(\.text).joined(separator: " ") ?? ""
+
+    #expect(text.contains("PDFKIT FALLBACK TEXT REMAINS SEARCHABLE"))
+    #expect(!text.contains("VISION SEARCH NOTICE"))
+}
+
+private struct StubLocalDocumentParser: LocalDocumentParsing {
+    let documentResult: Result<String, LocalDocumentParserError>
+    let PDFResult: Result<[StructuredPDFPage], LocalDocumentParserError>
+
+    func extractDocument(data: Data, fileExtension: String) throws -> String {
+        try documentResult.get()
+    }
+
+    func extractPDF(data: Data) throws -> [StructuredPDFPage] {
+        try PDFResult.get()
+    }
+}
+
+@MainActor
+private final class PDFTextFixtureView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.white.setFill()
+        bounds.fill()
+        NSString(string: "PDFKIT FALLBACK TEXT REMAINS SEARCHABLE WITHOUT OCR").draw(
+            at: NSPoint(x: 30, y: 140),
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 18),
+                .foregroundColor: NSColor.black,
+            ]
+        )
     }
 }
 
@@ -984,6 +1203,23 @@ private struct StubOCRTextRecognizer: OCRTextRecognizing {
         """
     )
     try legacy.execute(
+        """
+        CREATE TABLE files(
+            source_id TEXT PRIMARY KEY,
+            root_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            extension TEXT NOT NULL,
+            modified_at REAL,
+            size INTEGER NOT NULL,
+            availability TEXT NOT NULL,
+            desired_generation INTEGER NOT NULL,
+            applied_generation INTEGER NOT NULL,
+            error TEXT
+        )
+        """
+    )
+    try legacy.execute(
         "INSERT INTO history(id, query, mode, searched_at) VALUES('older', 'Joanna', 'text', 1)"
     )
     try legacy.execute(
@@ -992,6 +1228,8 @@ private struct StubOCRTextRecognizer: OCRTextRecognizing {
     _ = try ManifestStore(databaseURL: databaseURL)
     let columns = try legacy.query("PRAGMA table_info(scan_items)").compactMap { $0["name"]?.string }
     #expect(columns.contains("processed"))
+    let fileColumns = try legacy.query("PRAGMA table_info(files)").compactMap { $0["name"]?.string }
+    #expect(fileColumns.contains("extraction_version"))
     let historyColumns = try legacy.query("PRAGMA table_info(history)").compactMap { $0["name"]?.string }
     #expect(historyColumns.contains("normalized_query"))
     let retainedHistory = try legacy.query("SELECT id, normalized_query FROM history")

@@ -293,15 +293,21 @@ public actor LocalSearchEngine: SearchEngine {
             try await store.markRootReconciled(rootID: root.id)
             scheduleLexicalSync()
             try await store.setDiscoveryErrorCount(rootID: root.id, count: staged.summary.inaccessibleItemCount)
-            progressState = IndexProgress(
-                phase: .idle,
-                fraction: 1,
-                discovered: frozenCount,
-                eligible: frozenCount,
-                completed: progressState.completed,
-                skipped: progressState.skipped,
-                failed: progressState.failed
-            )
+            // Different roots may reconcile concurrently when an FSEvents
+            // catch-up arrives during a startup scan. They share the compact
+            // app-wide progress display, so one completed root must not hide
+            // another root that is still actively indexing.
+            if rootsBeingIndexed.count == 1 {
+                progressState = IndexProgress(
+                    phase: .idle,
+                    fraction: 1,
+                    discovered: frozenCount,
+                    eligible: frozenCount,
+                    completed: progressState.completed,
+                    skipped: progressState.skipped,
+                    failed: progressState.failed
+                )
+            }
             try await startMonitor(for: root)
             startSemanticWorker()
             if !unstableChanges.isEmpty {
@@ -420,6 +426,7 @@ public actor LocalSearchEngine: SearchEngine {
     }
 
     public func startupReconciliationIsDue(maximumAge: TimeInterval = 86_400) async throws -> Bool {
+        if try await store.hasOutdatedExtractions() { return true }
         for root in try await store.roots() where root.isEnabled && root.isAvailable {
             if try await store.reconciliationIsDue(rootID: root.id, maximumAge: maximumAge) {
                 return true

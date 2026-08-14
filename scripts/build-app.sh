@@ -61,17 +61,21 @@ CLANG_MODULE_CACHE_PATH="$BUILD_ROOT/clang-cache" swift build \
   --security-path "$BUILD_ROOT/security"
 BIN_PATH="$(CLANG_MODULE_CACHE_PATH="$BUILD_ROOT/clang-cache" swift build -c "$BUILD_CONFIGURATION" --show-bin-path --disable-sandbox --cache-path "$BUILD_ROOT/cache" --config-path "$BUILD_ROOT/config" --security-path "$BUILD_ROOT/security")"
 RUSTC="$RUSTC_BIN" "$CARGO_BIN" build --locked --release --manifest-path "$PROJECT_ROOT/rust-engine/Cargo.toml"
+RUSTC="$RUSTC_BIN" "$CARGO_BIN" build --locked --release --manifest-path "$PROJECT_ROOT/rust-extractor/Cargo.toml"
 
 rm -rf "$APP_ROOT"
 mkdir -p "$APP_ROOT/Contents/MacOS" "$APP_ROOT/Contents/Helpers" "$APP_ROOT/Contents/Resources" "$APP_ROOT/Contents/Frameworks" "$XPC_ROOT/Contents/MacOS" "$XPC_ROOT/Contents/Frameworks"
 cp "$PROJECT_ROOT/Resources/App/Info.plist" "$APP_ROOT/Contents/Info.plist"
 cp "$PROJECT_ROOT/Resources/App/AppIcon.icns" "$APP_ROOT/Contents/Resources/AppIcon.icns"
+cp "$PROJECT_ROOT/Resources/ThirdPartyNotices.txt" "$APP_ROOT/Contents/Resources/ThirdPartyNotices.txt"
+cp -R "$PROJECT_ROOT/Resources/PDFInspectorBCMaps" "$APP_ROOT/Contents/Resources/PDFInspectorBCMaps"
 cp "$PROJECT_ROOT/Resources/EngineXPC/Info.plist" "$XPC_ROOT/Contents/Info.plist"
 cp "$BIN_PATH/SearchMyMac" "$APP_ROOT/Contents/MacOS/SearchMyMac"
 cp "$BIN_PATH/smm" "$APP_ROOT/Contents/Helpers/smm"
 cp "$BIN_PATH/SearchMyMacEngineService" "$XPC_ROOT/Contents/MacOS/SearchMyMacEngineService"
 cp "$PROJECT_ROOT/rust-engine/target/release/libsearchmymac_engine.dylib" "$APP_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
 cp "$PROJECT_ROOT/rust-engine/target/release/libsearchmymac_engine.dylib" "$XPC_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
+cp "$PROJECT_ROOT/rust-extractor/target/release/libsearchmymac_extractor.dylib" "$APP_ROOT/Contents/Frameworks/libsearchmymac_extractor.dylib"
 if [[ ! -d "$BIN_PATH/llama.framework" ]]; then
   echo "SwiftPM did not stage llama.framework beside the built executables." >&2
   exit 1
@@ -167,6 +171,7 @@ fi
 
 codesign "${CODESIGN_ARGUMENTS[@]}" "$APP_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
 codesign "${CODESIGN_ARGUMENTS[@]}" "$XPC_ROOT/Contents/Frameworks/libsearchmymac_engine.dylib"
+codesign "${CODESIGN_ARGUMENTS[@]}" "$APP_ROOT/Contents/Frameworks/libsearchmymac_extractor.dylib"
 codesign "${CODESIGN_ARGUMENTS[@]}" "$APP_ROOT/Contents/Frameworks/llama.framework"
 codesign "${CODESIGN_ARGUMENTS[@]}" "$XPC_ROOT/Contents/Frameworks/llama.framework"
 if [[ "$SIGNING_IDENTITY" != "-" ]]; then

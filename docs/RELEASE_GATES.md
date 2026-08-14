@@ -12,7 +12,7 @@ The following items are deliberately tracked as release blockers rather than bei
 ## Extraction isolation and coverage
 
 - Add a separate sandboxed extractor XPC service that accepts only already-open read-only file handles and bounded metadata.
-- Add direct OOXML parsers for DOCX/PPTX and Calamine-backed XLS/XLSX/XLSB/ODS extraction; retain Foundation/system-importer fallback only where documented.
+- Move the bytes-only anydoc/pdf-inspector adapter behind the extractor XPC boundary and retain Foundation/system-importer fallback only where documented.
 - Add archive entry, expanded byte, compression ratio, recursion, pixel/page, text-retention, and per-parser wall-clock limits to every container adapter.
 - Verify HTML parsing cannot fetch remote resources or execute scripts.
 - Test `mdimport -t` property-list variants across the supported Pages/Numbers/Keynote fixture matrix.
