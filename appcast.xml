@@ -1,0 +1,22 @@
+<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
+IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
+--><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>Search My Mac</title>
+        <item>
+            <title>0.2.0</title>
+            <pubDate>Thu, 13 Aug 2026 19:06:58 -0400</pubDate>
+            <link>https://github.com/udfalkso/search-my-mac</link>
+            <sparkle:version>2</sparkle:version>
+            <sparkle:shortVersionString>0.2.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>13.3</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description sparkle:format="markdown"><![CDATA[Initial Version
+]]></description>
+            <enclosure url="https://github.com/udfalkso/search-my-mac/releases/download/v0.2.0/Search%20My%20Mac-0.2.0.zip" length="19171717" type="application/octet-stream" sparkle:edSignature="1UU5qN0QL4U64yPEb2Q0dH+L1JU24A0iYgzYn1KDzIcC/v4DonI/hnQQ/A/kCwGEJCLzhfm/b9f4wkrx4wboDw=="></enclosure>
+        </item>
+    </channel>
+</rss><!-- sparkle-signatures:
+edSignature: OPwM2N+o9AxUpNe0ij6pS19eKd7RLA/VMjLViuNT88WokYekagPrk4nw4sv31VutJ+RG/jr2K0UR3Dw+UTu0AQ==
+length: 1301
+-->

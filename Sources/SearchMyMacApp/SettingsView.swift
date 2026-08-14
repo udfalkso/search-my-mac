@@ -74,17 +74,23 @@ struct SettingsView: View {
                             }
                         }
                         Spacer(minLength: 12)
-                        Button("Check Now") { updates.checkForUpdates() }
+                        Button(action: updates.checkForUpdates) {
+                            HStack(spacing: 7) {
+                                if updates.isCheckingForUpdates {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                }
+                                Text(updates.isCheckingForUpdates ? "Checking…" : "Check Now")
+                            }
+                        }
                             .buttonStyle(.borderedProminent)
+                            .disabled(!updates.canCheckForUpdates)
                     }
                     .padding(18)
 
                     Divider().padding(.leading, 18)
 
-                    Toggle(isOn: Binding(
-                        get: { updates.automaticallyChecksForUpdates },
-                        set: { updates.setAutomaticallyChecksForUpdates($0) }
-                    )) {
+                    HStack(spacing: 24) {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Check for updates automatically")
                                 .font(.headline)
@@ -92,8 +98,14 @@ struct SettingsView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                        Spacer(minLength: 12)
+                        Toggle("Check for updates automatically", isOn: Binding(
+                            get: { updates.automaticallyChecksForUpdates },
+                            set: { updates.setAutomaticallyChecksForUpdates($0) }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
                     }
-                    .toggleStyle(.switch)
                     .padding(18)
 
                     Divider().padding(.leading, 18)
@@ -123,10 +135,7 @@ struct SettingsView: View {
 
                     Divider().padding(.leading, 18)
 
-                    Toggle(isOn: Binding(
-                        get: { updates.automaticallyDownloadsUpdates },
-                        set: { updates.setAutomaticallyDownloadsUpdates($0) }
-                    )) {
+                    HStack(spacing: 24) {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Download and install updates automatically")
                                 .font(.headline)
@@ -134,8 +143,14 @@ struct SettingsView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                        Spacer(minLength: 12)
+                        Toggle("Download and install updates automatically", isOn: Binding(
+                            get: { updates.automaticallyDownloadsUpdates },
+                            set: { updates.setAutomaticallyDownloadsUpdates($0) }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
                     }
-                    .toggleStyle(.switch)
                     .padding(18)
                     .disabled(!updates.automaticallyChecksForUpdates)
                 }

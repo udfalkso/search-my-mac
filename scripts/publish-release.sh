@@ -165,7 +165,7 @@ DOWNLOAD_PREFIX="https://github.com/$REPOSITORY/releases/download/$TAG/"
   --maximum-versions 1 \
   --maximum-deltas 0 \
   --embed-release-notes \
-  -o appcast.xml \
+  -o "$RELEASE_ROOT/appcast.xml" \
   "$RELEASE_ROOT"
 
 APPCAST_PATH="$RELEASE_ROOT/appcast.xml"

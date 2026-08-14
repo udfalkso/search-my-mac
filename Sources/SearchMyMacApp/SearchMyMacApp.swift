@@ -37,6 +37,7 @@ struct SearchMyMacApplication: App {
                 Button("Check for Updates…") {
                     updates.checkForUpdates()
                 }
+                .disabled(!updates.canCheckForUpdates)
             }
         }
     }
