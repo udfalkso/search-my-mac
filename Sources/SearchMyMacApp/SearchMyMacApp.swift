@@ -17,6 +17,7 @@ struct SearchMyMacApplication: App {
                 .environmentObject(updates)
                 .preferredColorScheme(selectedAppearance.colorScheme)
                 .frame(minWidth: 920, minHeight: 620)
+                .background(WindowFrameAutosaver(name: "SearchMyMacMainWindow"))
                 .onAppear { appDelegate.model = model }
         }
         .windowToolbarStyle(.unifiedCompact(showsTitle: false))
@@ -122,4 +123,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 extension Notification.Name {
     static let focusSearchMyMacField = Notification.Name("SearchMyMac.focusSearchField")
     static let showSearchMyMacSettings = Notification.Name("SearchMyMac.showSettings")
+}
+
+/// Persists the enclosing window's size and position across launches using
+/// AppKit's built-in frame autosave. Setting the autosave name restores a
+/// previously saved frame (if any) and arranges for the frame to be written to
+/// `UserDefaults` whenever it changes, so the window reopens where it was last
+/// left. AppKit clamps restored frames to the visible screen area, so a window
+/// saved on a now-disconnected display still reopens on-screen.
+private struct WindowFrameAutosaver: NSViewRepresentable {
+    let name: String
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        // The window is not attached during makeNSView; defer until it is.
+        DispatchQueue.main.async { [weak view] in
+            guard let window = view?.window else { return }
+            window.setFrameAutosaveName(name)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        guard let window = nsView.window, window.frameAutosaveName != name else { return }
+        window.setFrameAutosaveName(name)
+    }
 }
