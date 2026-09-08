@@ -11,13 +11,14 @@ struct SearchMyMacApplication: App {
     @AppStorage(AppAppearance.storageKey) private var appearance = AppAppearance.system.rawValue
 
     var body: some Scene {
-        WindowGroup("Search My Mac") {
+        WindowGroup("Search My Mac", id: MainWindowOpener.windowID) {
             ContentView()
                 .environmentObject(model)
                 .environmentObject(updates)
                 .preferredColorScheme(selectedAppearance.colorScheme)
                 .frame(minWidth: 920, minHeight: 620)
                 .background(WindowFrameAutosaver(name: "SearchMyMacMainWindow"))
+                .background(MainWindowOpenerCapture())
                 .onAppear { appDelegate.model = model }
         }
         .windowToolbarStyle(.unifiedCompact(showsTitle: false))
@@ -86,6 +87,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
+    // The app stays alive after its last window is closed (above) so the global
+    // hotkey can summon it like Spotlight. That leaves the app windowless, so it
+    // must be able to re-create a window on demand — otherwise clicking the Dock
+    // icon does nothing and the app is stuck running with no way to show a window.
+    // Recreate the main window whenever the Dock icon is clicked with none open.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if !hasVisibleWindows {
+            MainWindowOpener.shared.open()
+        }
+        return true
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let model else {
             Darwin._exit(EXIT_SUCCESS)
@@ -123,6 +136,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 extension Notification.Name {
     static let focusSearchMyMacField = Notification.Name("SearchMyMac.focusSearchField")
     static let showSearchMyMacSettings = Notification.Name("SearchMyMac.showSettings")
+}
+
+/// Bridges SwiftUI's `openWindow` action to callers outside the view tree (the
+/// `AppDelegate`'s Dock-reopen handler and the global hotkey), so the app can
+/// re-create its main window after the last one has been closed. Without this,
+/// a windowless app has no way back to a window: `NSApp.windows` is empty, so
+/// nothing can be brought forward, only created.
+@MainActor
+final class MainWindowOpener {
+    static let shared = MainWindowOpener()
+    static let windowID = "main"
+
+    /// Set by `MainWindowOpenerCapture` while a window exists; the captured
+    /// `openWindow` action remains valid to call even after every window closes.
+    var openAction: (() -> Void)?
+
+    func open() {
+        NSApp.activate(ignoringOtherApps: true)
+        openAction?()
+    }
+}
+
+/// Captures the environment's `openWindow` action into `MainWindowOpener`. Lives
+/// in the window's content, so it runs whenever a window is present and keeps the
+/// bridge pointed at a live action.
+private struct MainWindowOpenerCapture: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Color.clear
+            .onAppear {
+                MainWindowOpener.shared.openAction = {
+                    openWindow(id: MainWindowOpener.windowID)
+                }
+            }
+    }
 }
 
 /// Persists the enclosing window's size and position across launches using
