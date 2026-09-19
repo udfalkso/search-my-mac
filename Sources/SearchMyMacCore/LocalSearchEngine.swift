@@ -2,6 +2,8 @@ import Foundation
 
 public actor LocalSearchEngine: SearchEngine {
     private let store: ManifestStore
+    /// Reporting scans must never queue in front of interactive queries.
+    private let reportingStore: ManifestStore
     private let extractor: DocumentExtractor
     private let storageURL: URL
     private let semanticModels: SemanticModelManager
@@ -9,7 +11,7 @@ public actor LocalSearchEngine: SearchEngine {
     private let documentVectors: SemanticVectorIndex
     private let lexicalEngine: TantivyEngineBridge?
     private let isReadOnly: Bool
-    private let workGate = IndexingWorkGate()
+    private nonisolated let workGate = IndexingWorkGate()
     private var progressState = IndexProgress()
     private var isPaused = false
     private var phaseBeforePause: IndexPhase = .idle
@@ -22,7 +24,9 @@ public actor LocalSearchEngine: SearchEngine {
     private var semanticTask: Task<Void, Never>?
     private var documentTask: Task<Void, Never>?
     private var lexicalSyncTask: Task<Void, Never>?
+    private var lexicalMaintenanceInFlight = false
     private var semanticState = SemanticStatus()
+    private var semanticStatusRefresh = StatusRefreshSchedule()
     private var semanticPaused = false
     private var indexingPreferencesRevision = 0
     private var rootConfigurationRevisions: [String: Int] = [:]
@@ -42,49 +46,99 @@ public actor LocalSearchEngine: SearchEngine {
             databaseURL: baseURL.appendingPathComponent("manifest.sqlite3"),
             readOnly: readOnly
         )
-        extractor = DocumentExtractor()
+        reportingStore = try ManifestStore(
+            databaseURL: baseURL.appendingPathComponent("manifest.sqlite3"),
+            readOnly: true
+        )
+        extractor = DocumentExtractor(workGate: workGate)
         semanticModels = try SemanticModelManager(storageURL: baseURL, readOnly: readOnly)
         semanticVectors = try SemanticVectorIndex(
             directory: baseURL.appendingPathComponent("Semantic", isDirectory: true),
             modelID: SemanticModelDescriptor.qwen3.id,
             dimensions: SemanticModelDescriptor.qwen3.dimensions,
-            readOnly: readOnly
+            readOnly: readOnly,
+            workGate: workGate
         )
         documentVectors = try SemanticVectorIndex(
             directory: baseURL.appendingPathComponent("SemanticDocuments", isDirectory: true),
             modelID: SemanticModelDescriptor.enhancedUnderstanding.id,
             dimensions: SemanticModelDescriptor.enhancedUnderstanding.dimensions,
-            readOnly: readOnly
+            readOnly: readOnly,
+            workGate: workGate
         )
         lexicalEngine = readOnly
             ? nil
             : TantivyEngineBridge(indexURL: baseURL.appendingPathComponent("Tantivy-v3", isDirectory: true))
     }
 
-    public func search(_ request: SearchRequest) async throws -> SearchResponse {
+    /// Called before the UI debounce so typing immediately yields indexing.
+    public nonisolated func prioritizeSearch() {
+        workGate.noteSearchActivity()
+    }
+
+    public nonisolated func setSearchFieldFocused(_ focused: Bool) {
+        workGate.setSearchFieldFocused(focused)
+    }
+
+    public nonisolated var backgroundWorkShouldYield: Bool { workGate.shouldYieldToSearch }
+
+    public nonisolated func waitForSearchIdle() async throws {
+        try await workGate.yieldToSearch()
+    }
+
+    private nonisolated func backgroundOperation<T: Sendable>(
+        _ operation: @escaping @Sendable () throws -> T
+    ) async throws -> T {
+        let task = Task.detached(priority: .utility) { [workGate] in
+            try await workGate.indexingCheckpoint()
+            return try operation()
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    public nonisolated func search(_ request: SearchRequest) async throws -> SearchResponse {
+        let trace = SearchPerformanceTrace(requestID: request.id)
+        trace.mark("engine-request")
+        defer { trace.mark("engine-finished") }
+        workGate.beginSearch()
+        defer { workGate.endSearch() }
+        try Task.checkCancellation()
+        return try await performSearch(request)
+    }
+
+    private func performSearch(_ request: SearchRequest) async throws -> SearchResponse {
+        let trace = SearchPerformanceTrace(requestID: request.id)
+        try Task.checkCancellation()
         guard request.mode != .text, semanticState.isSearchReady, let embeddingModel else {
             return try await removingExcludedHits(from: lexicalSearch(request, recordInHistory: true))
         }
         let query = request.query
-        let queryVector = try await Task.detached(priority: .userInitiated) {
-            try embeddingModel.embedQuery(query)
-        }.value
+        let queryVector = try await Self.embedQuery(query, using: embeddingModel)
+        trace.mark("query-embedded")
+        try Task.checkCancellation()
         // Semantic post-filtering deliberately suppresses OCR/image passages by
         // default. Over-fetch enough nearest neighbors that substantive files
         // still have a chance to surface after that quality filter.
         let candidateLimit = request.filters == SearchFilters() ? 500 : 1_000
         let vectorMatches = try await semanticVectors.search(query: queryVector, limit: candidateLimit)
+        trace.mark("vectors-searched")
         let passageSemantic = try await removingExcludedHits(
             from: store.semanticSearchResponse(matches: vectorMatches, request: request)
         )
         let semantic: SearchResponse
+        trace.mark("semantic-materialized")
         let enhancedInstalled = (try? await semanticModels.installedModelURL(for: .enhancedUnderstanding)) != nil
         semanticState.enhancedUnderstandingInstalled = enhancedInstalled
         if enhancedInstalled, let enhancedEmbeddingModel {
-            let enhancedQueryVector = try await Task.detached(priority: .userInitiated) {
-                try enhancedEmbeddingModel.embedQuery(query)
-            }.value
+            let enhancedQueryVector = try await Self.embedQuery(query, using: enhancedEmbeddingModel)
+            trace.mark("enhanced-query-embedded")
+            try Task.checkCancellation()
             let documentMatches = try await documentVectors.search(query: enhancedQueryVector, limit: candidateLimit)
+            trace.mark("enhanced-vectors-searched")
             let documents = try await removingExcludedHits(
                 from: store.semanticDocumentSearchResponse(matches: documentMatches, request: request)
             )
@@ -107,14 +161,36 @@ public actor LocalSearchEngine: SearchEngine {
         return Self.hybridResponse(request: request, lexical: lexical, semantic: semantic)
     }
 
+    private nonisolated static func embedQuery(_ query: String, using model: QwenEmbeddingModel) async throws -> [Float] {
+        let task = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            return try model.embedQuery(query)
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
     public func semanticStatus() async -> SemanticStatus {
+        guard semanticStatusRefresh.begin(searchHasPriority: workGate.shouldYieldToSearch) else {
+            return semanticState
+        }
+        defer { semanticStatusRefresh.finish() }
         semanticState.enhancedUnderstandingInstalled =
             (try? await semanticModels.installedModelURL(for: .enhancedUnderstanding)) != nil
-        if let counts = try? await store.semanticDocumentCounts(modelID: SemanticModelDescriptor.enhancedUnderstanding.id) {
+        guard !workGate.shouldYieldToSearch else { return semanticState }
+        if let counts = try? await reportingStore.backgroundSemanticDocumentCounts(
+            modelID: SemanticModelDescriptor.enhancedUnderstanding.id, workGate: workGate
+        ) {
             semanticState.understoodDocuments = counts.ready
             semanticState.totalUnderstandingDocuments = counts.total
         }
-        if let counts = try? await store.semanticCounts(modelID: SemanticModelDescriptor.qwen3.id) {
+        guard !workGate.shouldYieldToSearch else { return semanticState }
+        if let counts = try? await reportingStore.backgroundSemanticCounts(
+            modelID: SemanticModelDescriptor.qwen3.id, workGate: workGate
+        ) {
             semanticState.embeddedPassages = counts.embedded
             semanticState.totalPassages = counts.total
             if semanticState.phase == .indexing, counts.total > 0, counts.embedded >= counts.total {
@@ -238,6 +314,7 @@ public actor LocalSearchEngine: SearchEngine {
     }
 
     public func index(root: IndexRoot) async throws {
+        try await workGate.yieldToSearch()
         if rootsBeingIndexed.contains(root.id) { return }
         rootsBeingIndexed.insert(root.id)
         defer { rootsBeingIndexed.remove(root.id) }
@@ -275,6 +352,7 @@ public actor LocalSearchEngine: SearchEngine {
                 rootRevision: rootRevision
             )
             let staged = try await discoveryResult
+            try await waitUntilResumed()
             let frozenCount = try await store.scanCount(scanID: scanID)
             let estimatedIndexBytes = Int64(frozenCount) * 700 + Int64(Double(staged.estimatedContentBytes) * 0.35)
             // A generation rebuild can coexist with the current index until atomic publication.
@@ -284,6 +362,7 @@ public actor LocalSearchEngine: SearchEngine {
             progressState.fraction = frozenCount == 0 ? 1 : Double(progressState.completed) / Double(frozenCount)
 
             progressState.phase = .committing
+            try await waitUntilResumed()
             try await store.finishScan(
                 scanID: scanID,
                 root: root,
@@ -291,6 +370,7 @@ public actor LocalSearchEngine: SearchEngine {
                 reconcileDeletions: staged.summary.inaccessibleItemCount == 0
             )
             try await store.markRootReconciled(rootID: root.id)
+            try await waitUntilResumed()
             scheduleLexicalSync()
             try await store.setDiscoveryErrorCount(rootID: root.id, count: staged.summary.inaccessibleItemCount)
             // Different roots may reconcile concurrently when an FSEvents
@@ -350,7 +430,10 @@ public actor LocalSearchEngine: SearchEngine {
     }
 
     public func progress() async -> IndexProgress { progressState }
-    public func health() async throws -> IndexHealth { try await store.health() }
+    public func health() async throws -> IndexHealth { try await reportingStore.health() }
+    public func backgroundHealth() async throws -> IndexHealth? {
+        try await reportingStore.backgroundHealth(workGate: workGate)
+    }
     public func indexIssues(limit: Int) async throws -> [IndexIssue] {
         try await store.indexIssues(limit: limit)
     }
@@ -360,12 +443,14 @@ public actor LocalSearchEngine: SearchEngine {
         let rootsByID = Dictionary(uniqueKeysWithValues: try await store.roots().map { ($0.id, $0) })
         let discovery = try await currentDiscovery()
         for issue in issues {
+            try await waitUntilResumed()
             try Task.checkCancellation()
             guard let root = rootsByID[issue.rootID], root.isEnabled, root.isAvailable else { continue }
             activateSecurityScope(for: root)
             guard let file = discovery.discoverSingle(root: root, url: issue.url) else { continue }
             let before = fileIdentity(at: file.url)
             let extracted = await extractor.extract(file)
+            try await waitUntilResumed()
             let after = fileIdentity(at: file.url)
             guard before == after else { continue }
             try await store.upsert(file: file, document: extracted)
@@ -481,6 +566,13 @@ public actor LocalSearchEngine: SearchEngine {
         }.value
         embeddingModel = model
         try await refreshSemanticEmbeddingsIfNeeded()
+        try await semanticVectors.prepareForSearch()
+        // Loading the model is search preparation, not periodic reporting.
+        // Initialize readiness here so deferred status polls cannot leave an
+        // existing semantic index stuck in Text mode while the field is focused.
+        let counts = try await store.semanticCounts(modelID: SemanticModelDescriptor.qwen3.id)
+        semanticState.embeddedPassages = counts.embedded
+        semanticState.totalPassages = counts.total
         semanticState.phase = .indexing
         semanticState.currentActivity = "Preparing semantic index…"
     }
@@ -543,6 +635,7 @@ public actor LocalSearchEngine: SearchEngine {
             // Never let it turn the required semantic index into a multi-day
             // job; it will begin as soon as the core lane catches up.
             while !Task.isCancelled && !semanticPaused {
+                try await waitUntilResumed()
                 let coreCounts = try await store.semanticCounts(modelID: SemanticModelDescriptor.qwen3.id)
                 if coreCounts.total > 0, coreCounts.embedded < coreCounts.total {
                     try await Task.sleep(for: .seconds(2))
@@ -552,15 +645,17 @@ public actor LocalSearchEngine: SearchEngine {
             }
             guard !Task.isCancelled, !semanticPaused else { return }
             guard let modelURL = try await semanticModels.installedModelURL(for: .enhancedUnderstanding) else { return }
-            let model = try await Task.detached(priority: .utility) {
+            try await waitUntilResumed()
+            let model = try await backgroundOperation {
                 try QwenEmbeddingModel(
                     url: modelURL,
                     dimensions: SemanticModelDescriptor.enhancedUnderstanding.dimensions
                 )
-            }.value
+            }
             enhancedEmbeddingModel = model
             defer { model.shutdown(); enhancedEmbeddingModel = nil }
             while !Task.isCancelled && !semanticPaused {
+                try await waitUntilResumed()
                 let coreCounts = try await store.semanticCounts(modelID: SemanticModelDescriptor.qwen3.id)
                 guard coreCounts.total == 0 || coreCounts.embedded >= coreCounts.total else { return }
                 let records = try await store.nextSemanticDocuments(modelID: SemanticModelDescriptor.enhancedUnderstanding.id, limit: 1)
@@ -569,10 +664,11 @@ public actor LocalSearchEngine: SearchEngine {
                     return
                 }
                 let card = SemanticModelDescriptor.documentInput(filename: record.filename, passage: record.text)
-                let vector = try await Task.detached(priority: .utility) {
-                    try model.embedDocument(card)
-                }.value
+                try await waitUntilResumed()
+                let vector = try await backgroundOperation { try model.embedDocument(card) }
+                try await waitUntilResumed()
                 try await documentVectors.append(key: record.key, vector: vector)
+                try await waitUntilResumed()
                 try await store.markSemanticDocument(sourceID: record.sourceID, card: card, modelID: SemanticModelDescriptor.enhancedUnderstanding.id)
                 semanticState.understoodDocuments += 1
                 try await documentVectors.rebuildIfNeeded()
@@ -591,19 +687,23 @@ public actor LocalSearchEngine: SearchEngine {
         guard let embeddingModel else { return }
         do {
             while !Task.isCancelled {
+                try await waitUntilResumed()
                 if semanticPaused { return }
                 let schedule = SemanticWorkSchedule(textIndexingIsActive: !rootsBeingIndexed.isEmpty)
                 let tombstones = try await store.pendingSemanticTombstones(limit: 1_000)
                 if !tombstones.isEmpty {
                     try await semanticVectors.tombstone(keys: tombstones)
+                    try await waitUntilResumed()
                     try await store.clearSemanticTombstones(tombstones)
                 }
+                try await waitUntilResumed()
                 let passages = try await store.nextSemanticPassages(
                     modelID: SemanticModelDescriptor.qwen3.id,
                     limit: schedule.batchSize
                 )
                 if passages.isEmpty {
                     try await semanticVectors.rebuildIfNeeded(force: true)
+                    try await waitUntilResumed()
                     let counts = try await store.semanticCounts(modelID: SemanticModelDescriptor.qwen3.id)
                     semanticState.embeddedPassages = counts.embedded
                     semanticState.totalPassages = counts.total
@@ -616,24 +716,25 @@ public actor LocalSearchEngine: SearchEngine {
                     continue
                 }
                 for start in stride(from: 0, to: passages.count, by: 2) {
+                    try await waitUntilResumed()
                     let end = min(start + 2, passages.count)
                     let passageBatch = Array(passages[start..<end])
                     let inputs = passageBatch.map {
                         SemanticModelDescriptor.documentInput(filename: $0.filename, passage: $0.text)
                     }
                     let workStartedAt = Date.timeIntervalSinceReferenceDate
-                    let vectors = try await Task.detached(priority: .utility) {
-                        try embeddingModel.embedDocuments(inputs)
-                    }.value
+                    let vectors = try await backgroundOperation { try embeddingModel.embedDocuments(inputs) }
                     guard vectors.count == passageBatch.count else {
                         throw SearchMyMacError.semantic("The semantic model returned an incomplete embedding batch.")
                     }
                     for (passage, vector) in zip(passageBatch, vectors) {
+                    try await waitUntilResumed()
                     try Task.checkCancellation()
                     if semanticPaused { return }
                     semanticState.phase = .indexing
                     semanticState.currentActivity = passage.filename
                     try await semanticVectors.append(key: passage.id, vector: vector)
+                    try await waitUntilResumed()
                     try await store.markPassageEmbedded(id: passage.id, modelID: SemanticModelDescriptor.qwen3.id)
                     semanticState.embeddedPassages += 1
                     if semanticState.embeddedPassages.isMultiple(of: 250) {
@@ -643,6 +744,7 @@ public actor LocalSearchEngine: SearchEngine {
                     try await throttleBackgroundIndexing(workStartedAt: workStartedAt)
                 }
                 try await semanticVectors.rebuildIfNeeded()
+                try await waitUntilResumed()
                 let counts = try await store.semanticCounts(modelID: SemanticModelDescriptor.qwen3.id)
                 semanticState.embeddedPassages = counts.embedded
                 semanticState.totalPassages = counts.total
@@ -665,8 +767,18 @@ public actor LocalSearchEngine: SearchEngine {
     }
 
     private func lexicalSearch(_ request: SearchRequest, recordInHistory: Bool) async throws -> SearchResponse {
+        let trace = SearchPerformanceTrace(requestID: request.id)
+        defer { trace.mark("lexical-finished") }
+        try Task.checkCancellation()
+        if lexicalMaintenanceInFlight {
+            return try await store.search(request, recordInHistory: recordInHistory)
+        }
         guard let lexicalEngine else { return try await store.search(request, recordInHistory: recordInHistory) }
         let generation = try await store.generation()
+        trace.mark("generation-read")
+        if lexicalMaintenanceInFlight {
+            return try await store.search(request, recordInHistory: recordInHistory)
+        }
         let committed = try lexicalEngine.committedGeneration()
         guard committed == generation else {
             scheduleLexicalSync()
@@ -681,7 +793,9 @@ public actor LocalSearchEngine: SearchEngine {
             offset = 0
         }
         let output = try lexicalEngine.search(request, offset: offset)
+        trace.mark("tantivy-searched")
         if recordInHistory { try await store.recordSearch(query: request.query, mode: request.mode) }
+        trace.mark("history-recorded")
         return try await store.materializeTantivy(output, request: request, offset: offset)
     }
 
@@ -703,6 +817,7 @@ public actor LocalSearchEngine: SearchEngine {
         }
         do {
             while !Task.isCancelled {
+                try await waitUntilResumed()
                 let target = try await store.generation()
                 var committed = try lexicalEngine.committedGeneration()
                 if committed > target { committed = -1 }
@@ -714,17 +829,23 @@ public actor LocalSearchEngine: SearchEngine {
                     }
                     let health = try await store.health()
                     try checkDiskSpace(at: storageURL, estimatedAdditional: health.lexicalIndexBytes)
-                    try lexicalEngine.reset()
+                    try await waitUntilResumed()
+                    try await performLexicalMaintenance { try lexicalEngine.reset() }
                     var lastSourceID: String?
                     while !Task.isCancelled {
+                        try await waitUntilResumed()
                         let documents = try await store.lexicalDocuments(afterSourceID: lastSourceID, limit: 250)
                         guard !documents.isEmpty else { break }
-                        for document in documents { try lexicalEngine.upsert(document.input) }
+                        for document in documents {
+                            try await waitUntilResumed()
+                            try lexicalEngine.upsert(document.input)
+                        }
                         lastSourceID = documents.last?.input.sourceID
                         await Task.yield()
                     }
                 } else {
                     for operation in try await store.lexicalOperations(after: committed) {
+                        try await waitUntilResumed()
                         try Task.checkCancellation()
                         switch operation.kind {
                         case .upsert:
@@ -738,7 +859,9 @@ public actor LocalSearchEngine: SearchEngine {
                         }
                     }
                 }
-                try lexicalEngine.commit(generation: target)
+                try await waitUntilResumed()
+                try await performLexicalMaintenance { try lexicalEngine.commit(generation: target) }
+                try await waitUntilResumed()
                 try await store.clearLexicalOperations(through: target)
                 if try await store.generation() == target { break }
             }
@@ -748,6 +871,14 @@ public actor LocalSearchEngine: SearchEngine {
             // SQLite FTS remains available while the derived index repairs itself.
             return
         }
+    }
+
+    private func performLexicalMaintenance(_ operation: @escaping @Sendable () throws -> Void) async throws {
+        lexicalMaintenanceInFlight = true
+        defer { lexicalMaintenanceInFlight = false }
+        // Commits can take seconds. Keep the engine actor available and use
+        // authoritative SQLite search until the new generation is published.
+        try await Task.detached(priority: .utility, operation: operation).value
     }
 
     static func hybridResponse(
@@ -1059,10 +1190,7 @@ public actor LocalSearchEngine: SearchEngine {
     }
 
     private func waitUntilResumed() async throws {
-        while isPaused {
-            if Task.isCancelled { throw SearchMyMacError.cancelled }
-            try await Task.sleep(for: .milliseconds(100))
-        }
+        try await workGate.indexingCheckpoint()
     }
 
     private func ensureCurrentIndexConfiguration(
@@ -1129,9 +1257,11 @@ public actor LocalSearchEngine: SearchEngine {
             return
         }
         do {
+            try await waitUntilResumed()
             guard let root = try await store.roots().first(where: { $0.id == rootID }) else { return }
             let discovery = try await currentDiscovery()
             let latestID = changes.map(\.eventID).max() ?? 0
+            try await waitUntilResumed()
             try await store.updateEventState(rootID: rootID, eventID: latestID)
 
             var isDirectory: ObjCBool = false
@@ -1164,6 +1294,7 @@ public actor LocalSearchEngine: SearchEngine {
                     guard let file = discovery.discoverSingle(root: root, url: url) else { continue }
                     let before = fileIdentity(at: url)
                     let document = await extractor.extract(file)
+                    try await waitUntilResumed()
                     guard before == fileIdentity(at: url) else {
                         requiresReconciliation = true
                         continue
@@ -1273,10 +1404,67 @@ private actor DiscoveryPipelineState {
     }
 }
 
-private final class IndexingWorkGate: @unchecked Sendable {
+final class IndexingWorkGate: @unchecked Sendable {
     private let condition = NSCondition()
     private var isPaused = false
     private var backgrounded = false
+    private var activeSearches = 0
+    private var searchFieldFocused = false
+    private var searchQuietUntil: TimeInterval = 0
+
+    var shouldYieldToSearch: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return searchFieldFocused || activeSearches > 0 || ProcessInfo.processInfo.systemUptime < searchQuietUntil
+    }
+
+    func setSearchFieldFocused(_ focused: Bool) {
+        condition.lock()
+        searchFieldFocused = focused
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func noteSearchActivity() {
+        condition.lock()
+        searchQuietUntil = ProcessInfo.processInfo.systemUptime + 0.5
+        condition.unlock()
+    }
+
+    func yieldToSearch() async throws {
+        while shouldYieldToSearch {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        try Task.checkCancellation()
+    }
+
+    private var indexingMustWait: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return isPaused || searchFieldFocused || activeSearches > 0
+            || ProcessInfo.processInfo.systemUptime < searchQuietUntil
+    }
+
+    func indexingCheckpoint() async throws {
+        while indexingMustWait {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        try Task.checkCancellation()
+    }
+
+    func beginSearch() {
+        condition.lock()
+        activeSearches += 1
+        condition.unlock()
+    }
+
+    func endSearch() {
+        condition.lock()
+        activeSearches -= 1
+        searchQuietUntil = ProcessInfo.processInfo.systemUptime + 0.5
+        condition.broadcast()
+        condition.unlock()
+    }
 
     var isBackgrounded: Bool {
         condition.lock()
@@ -1314,7 +1502,7 @@ private final class IndexingWorkGate: @unchecked Sendable {
     func waitUntilResumed() throws {
         condition.lock()
         defer { condition.unlock() }
-        while isPaused {
+        while isPaused || searchFieldFocused || activeSearches > 0 || ProcessInfo.processInfo.systemUptime < searchQuietUntil {
             if Task.isCancelled { throw SearchMyMacError.cancelled }
             condition.wait(until: Date(timeIntervalSinceNow: 0.1))
         }

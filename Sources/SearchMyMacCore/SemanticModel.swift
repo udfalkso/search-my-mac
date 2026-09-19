@@ -385,6 +385,7 @@ package final class QwenEmbeddingModel: @unchecked Sendable {
 
     private func embed(_ text: String, priority: InferenceAccessGate.Priority) throws -> [Float] {
         try inferenceGate.withAccess(priority: priority) {
+            try Task.checkCancellation()
             guard let model, let context else { throw SearchMyMacError.semantic("The model is not loaded.") }
             let vocab = llama_model_get_vocab(model)
             // This GGUF declares add_eos_token=true. Asking llama.cpp to add special

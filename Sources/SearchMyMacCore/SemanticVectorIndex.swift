@@ -16,17 +16,21 @@ actor SemanticVectorIndex {
     private let dimensions: Int
     private let vectors: FlatVectorStore
     private let isReadOnly: Bool
+    private let workGate: IndexingWorkGate?
     private var snapshot: USearchIndex?
     private var snapshotKeys: Set<UInt64> = []
+    private var snapshotGeneration = "none"
     private var activeKeys: Set<UInt64> = []
     private var isPrepared = false
+    private var revision = 0
 
-    init(directory: URL, modelID: String, dimensions: Int, readOnly: Bool = false) throws {
+    init(directory: URL, modelID: String, dimensions: Int, readOnly: Bool = false, workGate: IndexingWorkGate? = nil) throws {
         self.directory = directory
         self.manifestURL = directory.appendingPathComponent("hnsw-current.json")
         self.modelID = modelID
         self.dimensions = dimensions
         self.isReadOnly = readOnly
+        self.workGate = workGate
         if !readOnly {
             try FileManager.default.createDirectory(
                 at: directory,
@@ -38,6 +42,7 @@ actor SemanticVectorIndex {
     }
 
     func append(key: UInt64, vector: [Float]) async throws {
+        try await workGate?.indexingCheckpoint()
         guard !isReadOnly else { throw SearchMyMacError.semantic("The semantic index was opened read-only.") }
         guard vector.count == dimensions else {
             throw SearchMyMacError.semantic("Embedding dimension mismatch: expected \(dimensions), received \(vector.count).")
@@ -48,9 +53,11 @@ actor SemanticVectorIndex {
     }
 
     func tombstone(keys: [UInt64]) async throws {
+        try await workGate?.indexingCheckpoint()
         guard !isReadOnly else { throw SearchMyMacError.semantic("The semantic index was opened read-only.") }
         try await prepareIfNeeded()
         for key in keys {
+            try await workGate?.indexingCheckpoint()
             try await vectors.tombstone(key: key)
             activeKeys.remove(key)
         }
@@ -67,7 +74,9 @@ actor SemanticVectorIndex {
                 best[key] = max(best[key] ?? -.infinity, 1 - distance)
             }
         }
-        let delta = try await vectors.exactDeltaSearch(query: query, snapshotKeys: snapshotKeys, limit: limit)
+        let delta = try await vectors.exactDeltaSearch(
+            query: query, snapshotKeys: snapshotKeys, limit: limit, snapshotGeneration: snapshotGeneration
+        )
         for match in delta where activeKeys.contains(match.key) {
             best[match.key] = max(best[match.key] ?? -.infinity, match.score)
         }
@@ -77,9 +86,16 @@ actor SemanticVectorIndex {
             .map { $0 }
     }
 
+    func prepareForSearch() async throws {
+        try await prepareIfNeeded()
+        try await vectors.prepareDeltaForSearch(snapshotKeys: snapshotKeys, snapshotGeneration: snapshotGeneration)
+    }
+
     func rebuildIfNeeded(force: Bool = false) async throws {
         guard !isReadOnly else { return }
+        try await workGate?.indexingCheckpoint()
         try await prepareIfNeeded()
+        let expectedRevision = revision
         let addedThresholdReached = await vectors.shouldRebuildSnapshot(snapshotKeys: snapshotKeys)
         let removedCount = snapshotKeys.subtracting(activeKeys).count
         let removalThresholdReached = removedCount >= 10_000
@@ -87,12 +103,14 @@ actor SemanticVectorIndex {
         let thresholdReached = addedThresholdReached || removalThresholdReached
         let needsPublication = snapshot == nil || snapshotKeys != activeKeys
         guard thresholdReached || (force && needsPublication) else { return }
+        try await workGate?.indexingCheckpoint()
         let records = await vectors.activeRecords()
         guard !records.isEmpty else { return }
 
         let generation = UUID().uuidString
         let filename = "hnsw-\(generation).usearch"
         let temporary = directory.appendingPathComponent(filename + ".building")
+        defer { try? FileManager.default.removeItem(at: temporary) }
         let published = directory.appendingPathComponent(filename)
         let index = try USearchIndex.make(
             metric: .cos,
@@ -104,10 +122,16 @@ actor SemanticVectorIndex {
         var keys: [UInt64] = []
         keys.reserveCapacity(records.count)
         for record in records {
+            try await workGate?.indexingCheckpoint()
+            guard revision == expectedRevision else { return }
             guard let vector = try await vectors.vector(for: record.key), vector.count == dimensions else { continue }
+            try await workGate?.indexingCheckpoint()
+            guard revision == expectedRevision else { return }
             try index.add(key: record.key, vector: vector)
             keys.append(record.key)
         }
+        try await workGate?.indexingCheckpoint()
+        guard revision == expectedRevision else { return }
         try index.save(path: temporary.path)
 
         let validation = try USearchIndex.make(metric: .cos, dimensions: UInt32(dimensions), connectivity: 16, quantization: .i8)
@@ -136,6 +160,7 @@ actor SemanticVectorIndex {
 
         snapshot = validation
         snapshotKeys = Set(keys)
+        snapshotGeneration = filename
         for url in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
         where url.lastPathComponent.hasPrefix("hnsw-") && url.pathExtension == "usearch" && url != published {
             try? FileManager.default.removeItem(at: url)
@@ -144,7 +169,9 @@ actor SemanticVectorIndex {
 
     func clear() async throws {
         guard !isReadOnly else { throw SearchMyMacError.semantic("The semantic index was opened read-only.") }
+        revision &+= 1
         snapshot = nil
+        snapshotGeneration = UUID().uuidString
         snapshotKeys.removeAll()
         activeKeys.removeAll()
         isPrepared = true
@@ -175,6 +202,7 @@ actor SemanticVectorIndex {
                     try index.view(path: url.path)
                     snapshot = index
                     snapshotKeys = Set(manifest.keys).intersection(activeKeys)
+                    snapshotGeneration = manifest.filename
                 } catch {
                     snapshot = nil
                     snapshotKeys = []

@@ -29,9 +29,6 @@ final class AppModel: ObservableObject {
     @Published var selectedHitPath: String?
     @Published var errorMessage: String?
     @Published var isSearching = false
-    /// Kept separate from request activity so the first results can arrive only
-    /// after the loading indicator has had a chance to fade away.
-    @Published var showsSearchSpinner = false
     @Published var indexingRate: Double = 0
     @Published var launchAtLogin = false
     @Published var historyRecordingEnabled = true
@@ -83,6 +80,11 @@ final class AppModel: ObservableObject {
             await refreshAll()
             hasLoadedInitialState = true
             do {
+                // Installing/loading models is unnecessary for Text searches.
+                // A switch to a semantic mode makes loading foreground work.
+                while mode == .text, engine?.backgroundWorkShouldYield == true {
+                    try await Task.sleep(for: .milliseconds(100))
+                }
                 try await engine?.resumeSemanticIndexing()
                 if let engine {
                     semanticStatus = await engine.semanticStatus()
@@ -92,14 +94,17 @@ final class AppModel: ObservableObject {
                     }
                 }
             }
+            catch is CancellationError { return }
             catch { errorMessage = error.localizedDescription }
             do {
+                try await engine?.waitForSearchIdle()
                 try await engine?.startMonitoring()
                 if let engine,
                    try await engine.startupReconciliationIsDue(maximumAge: 86_400) {
                     await reconcileRoots()
                 }
             }
+            catch is CancellationError { return }
             catch { errorMessage = error.localizedDescription }
         }
         NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
@@ -121,7 +126,10 @@ final class AppModel: ObservableObject {
         semanticProgressTask = Task { [weak self] in
             while !Task.isCancelled {
                 if let engine = self?.engine {
-                    self?.semanticStatus = await engine.semanticStatus()
+                    do { try await engine.waitForSearchIdle() }
+                    catch { return }
+                    let status = await engine.semanticStatus()
+                    if !engine.backgroundWorkShouldYield { self?.semanticStatus = status }
                 }
                 try? await Task.sleep(for: .seconds(1))
             }
@@ -146,42 +154,45 @@ final class AppModel: ObservableObject {
         await engine?.shutdown()
     }
 
-    func scheduleSearch(immediately: Bool = false, clearingResults: Bool = false) {
+    func scheduleSearch(immediately: Bool = false) {
         searchTask?.cancel()
+        engine?.prioritizeSearch()
         let searchID = UUID()
+        let trace = SearchPerformanceTrace(requestID: searchID)
+        trace.mark("ui-scheduled")
         activeSearchID = searchID
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             results = []
             selectedHitPath = nil
             isSearching = false
-            showsSearchSpinner = false
             return
         }
-        if clearingResults {
-            results = []
-            selectedHitPath = nil
-        }
+        results = []
+        selectedHitPath = nil
         let querySnapshot = query
         let modeSnapshot = mode
         let filterSnapshot = filters.resolvingRootLocations(roots)
         let hybridSemanticWeightSnapshot = hybridSemanticWeight
         isSearching = true
-        showsSearchSpinner = results.isEmpty
-        searchTask = Task {
+        searchTask = Task(priority: .userInitiated) {
+            // Let the UI present the pending state before starting engine work,
+            // including searches submitted without the typing debounce.
+            await Task.yield()
             if !immediately {
                 try? await Task.sleep(for: .milliseconds(120))
             }
-            guard !Task.isCancelled, activeSearchID == searchID, let engine else { return }
+            guard !Task.isCancelled, activeSearchID == searchID else { return }
             isSearching = true
             defer {
                 if activeSearchID == searchID {
                     isSearching = false
-                    showsSearchSpinner = false
                 }
             }
+            guard let engine else { return }
             do {
                 let response = try await engine.search(
                     SearchRequest(
+                        id: searchID,
                         query: querySnapshot,
                         mode: modeSnapshot,
                         filters: filterSnapshot,
@@ -189,12 +200,8 @@ final class AppModel: ObservableObject {
                     )
                 )
                 guard !Task.isCancelled, activeSearchID == searchID else { return }
-                if showsSearchSpinner {
-                    showsSearchSpinner = false
-                    try? await Task.sleep(for: .milliseconds(110))
-                    guard !Task.isCancelled, activeSearchID == searchID else { return }
-                }
                 results = response.hits
+                trace.mark("ui-results-assigned")
                 if let selectedHitPath,
                    response.hits.contains(where: { $0.path == selectedHitPath }) {
                     self.selectedHitPath = selectedHitPath
@@ -209,10 +216,14 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func setSearchFieldFocused(_ focused: Bool) {
+        engine?.setSearchFieldFocused(focused)
+    }
+
     func useHistory(_ entry: SearchHistoryEntry) {
         query = entry.query
         mode = entry.mode
-        scheduleSearch(immediately: true, clearingResults: true)
+        scheduleSearch(immediately: true)
     }
 
     func useSavedSearch(_ saved: SavedSearch) {
@@ -220,7 +231,7 @@ final class AppModel: ObservableObject {
         mode = saved.request.mode
         filters = saved.request.filters
         hybridSemanticWeight = saved.request.hybridSemanticWeight
-        scheduleSearch(immediately: true, clearingResults: true)
+        scheduleSearch(immediately: true)
     }
 
     func updateHybridSemanticWeight(_ weight: Double) {
@@ -654,6 +665,7 @@ final class AppModel: ObservableObject {
     private func reconcileRoots() async {
         guard let engine, progress.phase == .idle else { return }
         do {
+            try await engine.waitForSearchIdle()
             let availableRoots = try await engine.roots().filter { $0.isEnabled && $0.isAvailable }
             beginIndexing(availableRoots, initialActivity: "Checking indexed locations…")
         } catch {
@@ -667,16 +679,32 @@ final class AppModel: ObservableObject {
             guard let engine else { return }
             var healthPoll = 0
             while !Task.isCancelled {
+                do { try await engine.waitForSearchIdle() }
+                catch { return }
                 updateProgress(await engine.progress())
-                semanticStatus = await engine.semanticStatus()
-                if healthPoll.isMultiple(of: 3), let liveHealth = try? await engine.health() {
-                    health = liveHealth
+                // The dedicated semantic poller owns coverage reporting.
+                do { try await engine.waitForSearchIdle() }
+                catch { return }
+                if healthPoll.isMultiple(of: 3), let liveHealth = try? await engine.backgroundHealth() {
+                    if !engine.backgroundWorkShouldYield { health = liveHealth }
                 }
                 healthPoll += 1
                 if !indexingWorkActive && (progress.phase == .idle || progress.phase == .failed) { break }
                 try? await Task.sleep(for: .milliseconds(350))
             }
-            await refreshAll()
+            do {
+                try await engine.waitForSearchIdle()
+                let refreshedRoots = try await engine.roots()
+                try await engine.waitForSearchIdle()
+                roots = refreshedRoots
+                if let liveHealth = try await engine.backgroundHealth(), !engine.backgroundWorkShouldYield {
+                    health = liveHealth
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 

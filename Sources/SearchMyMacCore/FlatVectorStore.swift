@@ -1,4 +1,5 @@
 import CryptoKit
+import Accelerate
 import Foundation
 
 public struct StoredVector: Codable, Sendable, Equatable {
@@ -34,6 +35,17 @@ public actor FlatVectorStore {
     private let journalURL: URL
     private let isReadOnly: Bool
     private var records: [UInt64: StoredVector] = [:]
+    private struct CachedVector {
+        let values: [Float]
+        let norm: Float
+    }
+    private var deltaVectors: [UInt64: CachedVector] = [:]
+    private var deltaCacheBytes = 0
+    private let maximumDeltaCacheBytes = 64 * 1_024 * 1_024
+    private var revision: UInt64 = 0
+    private var deltaRevision: UInt64?
+    private var deltaGeneration: String?
+    private var deltaRecords: [StoredVector] = []
 
     public init(directory: URL, readOnly: Bool = false) throws {
         isReadOnly = readOnly
@@ -86,6 +98,7 @@ public actor FlatVectorStore {
         try handle.synchronize()
         let record = StoredVector(key: key, offset: offset, dimensions: vector.count, checksum: checksum)
         records[key] = record
+        invalidateDeltaVector(key)
         try appendManifestRecord(record)
         return record
     }
@@ -114,6 +127,7 @@ public actor FlatVectorStore {
         guard var record = records[key] else { return }
         record.tombstoned = true
         records[key] = record
+        invalidateDeltaVector(key)
         try appendManifestRecord(record)
     }
 
@@ -124,6 +138,11 @@ public actor FlatVectorStore {
     public func clear() throws {
         guard !isReadOnly else { throw SearchMyMacError.semantic("The vector index was opened read-only.") }
         records.removeAll()
+        revision &+= 1
+        deltaVectors.removeAll()
+        deltaRecords.removeAll()
+        deltaRevision = nil
+        deltaCacheBytes = 0
         try Data().write(to: dataURL, options: [.atomic])
         try Data().write(to: journalURL, options: [.atomic])
         try? FileManager.default.removeItem(at: manifestURL)
@@ -146,26 +165,74 @@ public actor FlatVectorStore {
     public func exactDeltaSearch(
         query: [Float],
         snapshotKeys: Set<UInt64>,
-        limit: Int
+        limit: Int,
+        snapshotGeneration: String? = nil
     ) throws -> [VectorMatch] {
         guard !query.isEmpty, limit > 0 else { return [] }
-        let queryNorm = sqrt(query.reduce(0) { $0 + $1 * $1 })
+        var querySquaredNorm: Float = 0
+        vDSP_svesq(query, 1, &querySquaredNorm, vDSP_Length(query.count))
+        let queryNorm = sqrt(querySquaredNorm)
         guard queryNorm > 0 else { return [] }
         var matches: [VectorMatch] = []
         let handle = try FileHandle(forReadingFrom: dataURL)
         defer { try? handle.close() }
-        for record in records.values where !record.tombstoned && !snapshotKeys.contains(record.key) && record.dimensions == query.count {
-            guard let vector = try vector(for: record, handle: handle) else { continue }
+        for record in candidates(snapshotKeys: snapshotKeys, generation: snapshotGeneration) where record.dimensions == query.count {
+            try Task.checkCancellation()
+            guard let cached = try cachedDeltaVector(for: record, handle: handle) else { continue }
             var dot: Float = 0
-            var norm: Float = 0
-            for index in vector.indices {
-                dot += query[index] * vector[index]
-                norm += vector[index] * vector[index]
-            }
-            guard norm > 0 else { continue }
-            matches.append(VectorMatch(key: record.key, score: dot / (queryNorm * sqrt(norm))))
+            vDSP_dotpr(query, 1, cached.values, 1, &dot, vDSP_Length(query.count))
+            guard cached.norm > 0 else { continue }
+            matches.append(VectorMatch(key: record.key, score: dot / (queryNorm * cached.norm)))
         }
         return matches.sorted { $0.score > $1.score }.prefix(limit).map { $0 }
+    }
+
+    /// Warm the bounded, checksum-validated delta during semantic preparation,
+    /// so subsequent queries avoid per-vector disk I/O and Float16 decoding.
+    func prepareDeltaForSearch(snapshotKeys: Set<UInt64>, snapshotGeneration: String) throws {
+        let handle = try FileHandle(forReadingFrom: dataURL)
+        defer { try? handle.close() }
+        for record in candidates(snapshotKeys: snapshotKeys, generation: snapshotGeneration) {
+            try Task.checkCancellation()
+            guard deltaCacheBytes + record.dimensions * MemoryLayout<Float>.stride <= maximumDeltaCacheBytes else { break }
+            _ = try cachedDeltaVector(for: record, handle: handle)
+        }
+    }
+
+    private func candidates(snapshotKeys: Set<UInt64>, generation: String?) -> [StoredVector] {
+        if generation != nil, deltaGeneration == generation, deltaRevision == revision { return deltaRecords }
+        deltaRecords = records.values.filter { !$0.tombstoned && !snapshotKeys.contains($0.key) }
+        deltaGeneration = generation
+        deltaRevision = revision
+        for key in Array(deltaVectors.keys) where snapshotKeys.contains(key) || records[key]?.tombstoned != false {
+            if let removed = deltaVectors.removeValue(forKey: key) {
+                deltaCacheBytes -= removed.values.count * MemoryLayout<Float>.stride
+            }
+        }
+        return deltaRecords
+    }
+
+    private func cachedDeltaVector(for record: StoredVector, handle: FileHandle) throws -> CachedVector? {
+        if let cached = deltaVectors[record.key] { return cached }
+        // The first read still checks the persisted checksum. Only validated
+        // in-memory values are reused; no integrity check is bypassed on load.
+        guard let values = try vector(for: record, handle: handle) else { return nil }
+        var squaredNorm: Float = 0
+        vDSP_svesq(values, 1, &squaredNorm, vDSP_Length(values.count))
+        let cached = CachedVector(values: values, norm: sqrt(squaredNorm))
+        let bytes = values.count * MemoryLayout<Float>.stride
+        if deltaCacheBytes + bytes <= maximumDeltaCacheBytes {
+            deltaVectors[record.key] = cached
+            deltaCacheBytes += bytes
+        }
+        return cached
+    }
+
+    private func invalidateDeltaVector(_ key: UInt64) {
+        revision &+= 1
+        if let removed = deltaVectors.removeValue(forKey: key) {
+            deltaCacheBytes -= removed.values.count * MemoryLayout<Float>.stride
+        }
     }
 
     private func appendManifestRecord(_ record: StoredVector) throws {

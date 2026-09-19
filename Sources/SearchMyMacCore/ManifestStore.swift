@@ -1045,6 +1045,21 @@ actor ManifestStore {
         )
     }
 
+    func backgroundHealth(workGate: IndexingWorkGate) throws -> IndexHealth? {
+        guard !workGate.shouldYieldToSearch else { return nil }
+        return try health()
+    }
+
+    func backgroundSemanticCounts(modelID: String, workGate: IndexingWorkGate) throws -> (embedded: Int, total: Int)? {
+        guard !workGate.shouldYieldToSearch else { return nil }
+        return try semanticCounts(modelID: modelID)
+    }
+
+    func backgroundSemanticDocumentCounts(modelID: String, workGate: IndexingWorkGate) throws -> (ready: Int, total: Int)? {
+        guard !workGate.shouldYieldToSearch else { return nil }
+        return try semanticDocumentCounts(modelID: modelID)
+    }
+
     func indexIssues(limit: Int) throws -> [IndexIssue] {
         try database.query(
             """

@@ -101,6 +101,7 @@ public struct DocumentExtractor: Sendable {
     private let chunker: PassageChunker
     private let textRecognizer: any OCRTextRecognizing
     private let localDocumentParser: (any LocalDocumentParsing)?
+    private var workGate: IndexingWorkGate?
 
     public init(limits: ExtractionLimits = .init(), chunker: PassageChunker = .init()) {
         self.limits = limits
@@ -109,16 +110,23 @@ public struct DocumentExtractor: Sendable {
         localDocumentParser = AnydocExtractorBridge()
     }
 
+    init(workGate: IndexingWorkGate) {
+        self.init()
+        self.workGate = workGate
+    }
+
     init(
         limits: ExtractionLimits = .init(),
         chunker: PassageChunker = .init(),
         textRecognizer: any OCRTextRecognizing,
-        localDocumentParser: (any LocalDocumentParsing)? = AnydocExtractorBridge()
+        localDocumentParser: (any LocalDocumentParsing)? = AnydocExtractorBridge(),
+        workGate: IndexingWorkGate? = nil
     ) {
         self.limits = limits
         self.chunker = chunker
         self.textRecognizer = textRecognizer
         self.localDocumentParser = localDocumentParser
+        self.workGate = workGate
     }
 
     public func extract(_ file: DiscoveredFile) async -> ExtractedDocument? {
@@ -130,6 +138,7 @@ public struct DocumentExtractor: Sendable {
         }
 
         do {
+            try await workGate?.indexingCheckpoint()
             switch ext {
             case "pdf":
                 return try await extractPDF(file.url)
@@ -153,6 +162,7 @@ public struct DocumentExtractor: Sendable {
     }
 
     private func extractPDF(_ url: URL) async throws -> ExtractedDocument {
+        try await workGate?.indexingCheckpoint()
         guard let document = PDFDocument(url: url) else {
             throw SearchMyMacError.extraction("PDFKit could not open the document")
         }
@@ -172,6 +182,7 @@ public struct DocumentExtractor: Sendable {
         var passages: [ExtractedPassage] = []
         var ordinal = 0
         for pageIndex in 0..<document.pageCount {
+            try await workGate?.indexingCheckpoint()
             if Task.isCancelled { throw SearchMyMacError.cancelled }
             guard let page = document.page(at: pageIndex) else { continue }
             let structuredPage = structuredPages[pageIndex]
@@ -228,6 +239,7 @@ public struct DocumentExtractor: Sendable {
     }
 
     private func extractWithCompatibilityImporter(_ url: URL, extension ext: String) async throws -> ExtractedDocument {
+        try await workGate?.indexingCheckpoint()
         switch ext {
         case "rtf", "doc", "docx", "docm", "odt":
             return try extractAttributedDocument(url, extension: ext)
@@ -252,6 +264,7 @@ public struct DocumentExtractor: Sendable {
         guard hasMeaningfulInk(image) else {
             return ExtractedDocument(passages: [], availability: .filenameOnly)
         }
+        try await workGate?.indexingCheckpoint()
         let text = try await textRecognizer.recognizeText(in: image)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
@@ -382,6 +395,7 @@ public struct DocumentExtractor: Sendable {
     }
 
     private func recognizeText(on page: PDFPage) async throws -> String {
+        try await workGate?.indexingCheckpoint()
         let bounds = page.bounds(for: .mediaBox)
         let scale = min(limits.OCRMaximumDimension / max(bounds.width, bounds.height), 3)
         let size = CGSize(width: max(bounds.width * scale, 1), height: max(bounds.height * scale, 1))

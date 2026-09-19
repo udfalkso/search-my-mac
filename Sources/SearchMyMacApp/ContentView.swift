@@ -622,7 +622,7 @@ private struct SidebarView: View {
                         selection = .allFiles
                         model.filters.rootIDs.removeAll()
                         model.filters.pathPrefixes.removeAll()
-                        model.scheduleSearch(clearingResults: true)
+                        model.scheduleSearch()
                     } label: {
                         Label("All Indexed Files", systemImage: "doc.text.magnifyingglass")
                             .fontWeight(.medium)
@@ -645,7 +645,7 @@ private struct SidebarView: View {
                                 selection = .root(root.id)
                                 model.filters.rootIDs = [root.id]
                                 model.filters.pathPrefixes.removeAll()
-                                model.scheduleSearch(clearingResults: true)
+                                model.scheduleSearch()
                             } label: {
                                 Label(
                                     root.displayName,
@@ -879,6 +879,7 @@ private struct SidebarUtilityButton: View {
 private struct SearchToolbar: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.scenePhase) private var scenePhase
     @AppStorage("semanticTip.dismissedPhase") private var dismissedSemanticTipPhase = ""
     @FocusState private var focused: Bool
     @State private var showsFilters = false
@@ -894,13 +895,34 @@ private struct SearchToolbar: View {
                             ? SearchMyMacTheme.lensBlue
                             : Color.secondary
                     )
-                TextField("Search filenames and document text", text: $model.query)
+                TextField("Search filenames and document text", text: Binding(
+                    get: { model.query },
+                    set: { value in
+                        model.query = value
+                        model.results = []
+                        model.selectedHitPath = nil
+                        // Publish feedback in the text-edit callback itself;
+                        // scheduling and debouncing happen in onChange below.
+                        model.isSearching = !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    }
+                ))
                     .textFieldStyle(.plain)
                     .font(.system(size: 18))
                     .focused($focused)
                     .onSubmit { model.scheduleSearch() }
                     .onChange(of: model.query) { _ in model.scheduleSearch() }
-                if model.isSearching { ProgressView().controlSize(.small) }
+                if model.isSearching {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Searching…")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    .fixedSize()
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Searching")
+                    .transaction { $0.animation = nil }
+                }
                 if !model.query.isEmpty {
                     Button { model.query = ""; model.results = [] } label: { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.plain).foregroundStyle(.secondary)
@@ -979,19 +1001,19 @@ private struct SearchToolbar: View {
                         ForEach(selectedRootFilters) { root in
                             FilterChip(title: root.displayName, symbol: "folder") {
                                 model.filters.rootIDs.remove(root.id)
-                                model.scheduleSearch(clearingResults: true)
+                                model.scheduleSearch()
                             }
                         }
                         ForEach(model.filters.pathPrefixes.sorted(), id: \.self) { path in
                             FilterChip(title: URL(fileURLWithPath: path).lastPathComponent, symbol: "folder") {
                                 model.filters.pathPrefixes.remove(path)
-                                model.scheduleSearch(clearingResults: true)
+                                model.scheduleSearch()
                             }
                         }
                         if !model.filters.extensions.isEmpty {
                             FilterChip(title: selectedFileTypesSummary, symbol: "doc") {
                                 model.filters.extensions.removeAll()
-                                model.scheduleSearch(clearingResults: true)
+                                model.scheduleSearch()
                             }
                         }
                         if hasDateFilter {
@@ -1021,6 +1043,13 @@ private struct SearchToolbar: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .focusSearchMyMacField)) { _ in focused = true }
+        .onChange(of: focused) { value in
+            model.setSearchFieldFocused(value && scenePhase == .active)
+        }
+        .onChange(of: scenePhase) { value in
+            model.setSearchFieldFocused(focused && value == .active)
+        }
+        .onDisappear { model.setSearchFieldFocused(false) }
         .task { focused = true }
     }
 
@@ -1067,7 +1096,7 @@ private struct SearchToolbar: View {
     private func clearDateFilter() {
         model.filters.modifiedAfter = nil
         model.filters.modifiedBefore = nil
-        model.scheduleSearch(clearingResults: true)
+        model.scheduleSearch()
     }
 
     private var saveSearchHelp: String {
@@ -1235,7 +1264,7 @@ private struct SearchFiltersPopover: View {
             HStack {
                 Button("Clear All") {
                     model.filters = SearchFilters()
-                    model.scheduleSearch(clearingResults: true)
+                    model.scheduleSearch()
                 }
                 .disabled(!hasActiveFilters)
                 Spacer()
@@ -1291,7 +1320,7 @@ private struct SearchFiltersPopover: View {
                 model.filters.modifiedAfter = preset.dateComponents.flatMap {
                     Calendar.current.date(byAdding: $0, to: .now)
                 }
-                model.scheduleSearch(clearingResults: true)
+                model.scheduleSearch()
             }
         )
     }
@@ -1302,7 +1331,7 @@ private struct SearchFiltersPopover: View {
             set: { enabled in
                 if enabled { model.filters.rootIDs.insert(rootID) }
                 else { model.filters.rootIDs.remove(rootID) }
-                model.scheduleSearch(clearingResults: true)
+                model.scheduleSearch()
             }
         )
     }
@@ -1313,7 +1342,7 @@ private struct SearchFiltersPopover: View {
             set: { enabled in
                 if enabled { model.filters.pathPrefixes.insert(path) }
                 else { model.filters.pathPrefixes.remove(path) }
-                model.scheduleSearch(clearingResults: true)
+                model.scheduleSearch()
             }
         )
     }
@@ -1324,7 +1353,7 @@ private struct SearchFiltersPopover: View {
             set: { enabled in
                 if enabled { model.filters.extensions.formUnion(extensions) }
                 else { model.filters.extensions.subtract(extensions) }
-                model.scheduleSearch(clearingResults: true)
+                model.scheduleSearch()
             }
         )
     }
@@ -2533,7 +2562,7 @@ private struct EmptyResultsView: View {
                         let words = model.query.split(whereSeparator: \.isWhitespace)
                         if words.count > 1 {
                             model.query = words.dropLast().joined(separator: " ")
-                            model.scheduleSearch(immediately: true, clearingResults: true)
+                            model.scheduleSearch(immediately: true)
                         }
                     }
                     .disabled(model.query.split(whereSeparator: \.isWhitespace).count < 2)

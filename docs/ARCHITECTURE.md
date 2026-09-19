@@ -2,6 +2,63 @@
 
 ## Process ownership
 
+Interactive search has priority over background indexing. Focusing the search
+field in the active app holds the gate until focus leaves or the app becomes
+inactive. The app also signals typing before its debounce; a shared gate holds discovery, extraction, semantic workers,
+and derived-index maintenance at safe checkpoints while queries are active and
+for 500 ms afterward. Overlapping requests keep the gate held until all finish,
+including cancellation and error paths. Cancelled semantic queries skip inference
+once they acquire the model gate. Already-running synchronous work finishes its
+current unit before yielding. Tantivy reset and commit run off the engine actor;
+queries use authoritative SQLite FTS while those operations are in flight.
+Each new search clears previous results and immediately presents a loading spinner.
+
+Health and semantic-status reporting use a separate read-only SQLite connection
+and actor so full-index counts cannot block search between its database stages.
+Semantic status polls are coalesced, spaced at least five seconds apart, and
+serve the in-memory state whenever search has priority, including the first poll.
+Model loading initializes semantic readiness independently of periodic reporting.
+This matters even in Text mode: coverage reporting previously scanned hundreds
+of thousands of passages on the search actor's database several times per second.
+
+The shared priority gate also parks periodic health/progress UI polling and
+reconciliation, filesystem-event processing before database access, background
+model loading/inference, vector writes and rebuilds, and extraction between PDF
+pages and before OCR. Text-mode startup defers optional model loading until idle;
+loading required for a selected semantic mode remains foreground preparation.
+Waiting background tasks remain cancellable, and releasing search priority does
+not release an explicit indexing pause. A running synchronous parser call,
+database transaction, native index operation, or GPU decode cannot be suspended
+mid-operation; it completes its current unit before the next checkpoint. Search
+execution, its result rendering/preview, and explicitly requested settings work
+remain foreground operations. Filesystem notifications are retained for later
+processing rather than discarded while searching.
+
+For local search profiling, launch the assembled app with
+`open --env SMM_PROFILE_SEARCH=1 ".build/Search My Mac.app"` after quitting the
+running copy. Inspect the `com.searchmymac.app` / `SearchPerformance` category in
+Console. Timings include UI scheduling, generation reads, Tantivy lookup, history,
+materialization, engine completion, and assignment of results to the UI. Each
+trace's elapsed time starts at its own entry point; correlate stages by request
+UUID. Logs contain timings and request IDs, never queries or document content.
+
+Semantic passage vectors are precomputed during indexing. An immutable HNSW
+snapshot covers the published vectors; newer vectors remain searchable through
+an exact delta search. The delta search caches checksum-validated Float32 values
+and norms (up to 64 MiB of vector payload), uses Accelerate for cosine scoring,
+and caches delta membership by snapshot generation and vector-store revision.
+Replacing/tombstoning vectors and publishing snapshots invalidate the relevant
+cache entries. Model preparation warms the HNSW view and delta cache before
+marking semantic search ready. This avoids rereading, rehashing, and decoding
+thousands of vectors for every keystroke without changing the exact-delta ranking
+method or requiring a reindex.
+
+The opt-in `profileLiveSemanticSearch` test opens the local index read-only and
+reports model loading, index opening, query embedding, vector search, and result
+materialization times. Enable it with `SMM_PROFILE_SEMANTIC=1`; optionally set
+`SMM_PROFILE_PREWARM=1` and `SMM_PROFILE_QUERY`. It requires local GPU access and is
+skipped by the ordinary test suite. Profile logs contain only timings and counts.
+
 The resident main application owns root selection, protected-folder access, file discovery, FSEvents, scheduling, progress, and presentation. Closing all windows does not terminate it; explicit Quit does.
 
 The bundled engine XPC service is app-sandboxed and exports only a small data protocol. Its listener rejects connections unless the caller satisfies its configured code-signing requirement, and the client applies the corresponding service requirement before resuming its connection. Provisioned release builds pin identifiers, Team ID, and private entitlements. Ad-hoc development signatures cannot legally carry those custom restricted entitlements on current macOS, so development builds use identifier-only requirements and are not a security-equivalent distribution artifact.
