@@ -80,6 +80,16 @@ final class AppModel: ObservableObject {
             await refreshAll()
             hasLoadedInitialState = true
             do {
+                try await engine?.waitForSearchIdle()
+                try await engine?.startMonitoring()
+                if let engine,
+                   try await engine.startupReconciliationIsDue(maximumAge: 86_400) {
+                    await reconcileRoots()
+                }
+            }
+            catch is CancellationError { return }
+            catch { errorMessage = error.localizedDescription }
+            do {
                 // Installing/loading models is unnecessary for Text searches.
                 // A switch to a semantic mode makes loading foreground work.
                 while mode == .text, engine?.backgroundWorkShouldYield == true {
@@ -92,16 +102,6 @@ final class AppModel: ObservableObject {
                        semanticStatus.phase != .notInstalled {
                         mode = .hybrid
                     }
-                }
-            }
-            catch is CancellationError { return }
-            catch { errorMessage = error.localizedDescription }
-            do {
-                try await engine?.waitForSearchIdle()
-                try await engine?.startMonitoring()
-                if let engine,
-                   try await engine.startupReconciliationIsDue(maximumAge: 86_400) {
-                    await reconcileRoots()
                 }
             }
             catch is CancellationError { return }

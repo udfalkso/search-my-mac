@@ -195,7 +195,7 @@ public struct FileDiscovery: Sendable {
         let keys: [URLResourceKey] = [
             .isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .isPackageKey,
             .contentModificationDateKey, .fileSizeKey, .isUbiquitousItemKey,
-            .ubiquitousItemDownloadingStatusKey,
+            .ubiquitousItemDownloadingStatusKey, .ubiquitousItemIsDownloadingKey,
             .volumeIdentifierKey, .fileResourceIdentifierKey
         ]
         var inaccessibleItemCount = 0
@@ -254,7 +254,7 @@ public struct FileDiscovery: Sendable {
         let keys: Set<URLResourceKey> = [
             .isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .isPackageKey,
             .contentModificationDateKey, .fileSizeKey, .isUbiquitousItemKey,
-            .ubiquitousItemDownloadingStatusKey,
+            .ubiquitousItemDownloadingStatusKey, .ubiquitousItemIsDownloadingKey,
             .volumeIdentifierKey, .fileResourceIdentifierKey
         ]
         guard let values = try? url.resourceValues(forKeys: keys),
@@ -274,7 +274,11 @@ public struct FileDiscovery: Sendable {
         let volume = values.volumeIdentifier.map { String(describing: $0) } ?? "unknown"
         let identity = inode == 0 ? "\(volume):\(url.standardizedFileURL.path)" : "\(volume):\(inode)"
         let sourceID = SHA256.hash(data: Data(identity.utf8)).map { String(format: "%02x", $0) }.joined()
-        let isPlaceholder = values.isUbiquitousItem == true && values.ubiquitousItemDownloadingStatus != .current
+        let isPlaceholder = Self.isWaitingForDownload(
+            isUbiquitous: values.isUbiquitousItem == true,
+            status: values.ubiquitousItemDownloadingStatus,
+            isDownloading: values.ubiquitousItemIsDownloading == true
+        )
         return DiscoveredFile(
             sourceID: sourceID,
             rootID: root.id,
@@ -283,5 +287,15 @@ public struct FileDiscovery: Sendable {
             size: Int64(values.fileSize ?? 0),
             availability: isPlaceholder ? .waitingForDownload : .filenameOnly
         )
+    }
+
+    /// File Provider can omit downloading status for fully resident files.
+    /// Only an explicit not-downloaded or active-download state is a placeholder.
+    static func isWaitingForDownload(
+        isUbiquitous: Bool,
+        status: URLUbiquitousItemDownloadingStatus?,
+        isDownloading: Bool
+    ) -> Bool {
+        isUbiquitous && (status == .notDownloaded || isDownloading)
     }
 }

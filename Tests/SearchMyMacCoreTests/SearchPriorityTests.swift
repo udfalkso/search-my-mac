@@ -70,6 +70,18 @@ import Testing
     #expect(!gate.shouldYieldToSearch)
 }
 
+@Test func focusedSearchFieldReleasesIndexingAfterFiveMinuteEquivalentIdlePeriod() async throws {
+    let gate = IndexingWorkGate(focusedIdleTimeout: 0.15, postSearchQuietPeriod: 0.01)
+    gate.setSearchFieldFocused(true)
+    #expect(gate.shouldYieldToSearch)
+    try await Task.sleep(for: .milliseconds(250))
+    #expect(!gate.shouldYieldToSearch)
+    gate.noteSearchActivity()
+    #expect(gate.shouldYieldToSearch)
+    try await Task.sleep(for: .milliseconds(250))
+    #expect(!gate.shouldYieldToSearch)
+}
+
 @Test func leavingSearchFieldDoesNotOverrideActiveSearch() {
     let gate = IndexingWorkGate()
     gate.setSearchFieldFocused(true)

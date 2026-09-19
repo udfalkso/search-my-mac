@@ -24,6 +24,7 @@ public actor LocalSearchEngine: SearchEngine {
     private var semanticTask: Task<Void, Never>?
     private var documentTask: Task<Void, Never>?
     private var lexicalSyncTask: Task<Void, Never>?
+    private var downloadRetryTask: Task<Void, Never>?
     private var lexicalMaintenanceInFlight = false
     private var semanticState = SemanticStatus()
     private var semanticStatusRefresh = StatusRefreshSchedule()
@@ -458,6 +459,76 @@ public actor LocalSearchEngine: SearchEngine {
         scheduleLexicalSync()
         startSemanticWorker()
     }
+
+    private func startDownloadRetryWorker() {
+        guard !isReadOnly, downloadRetryTask == nil else { return }
+        downloadRetryTask = Task { [weak self] in
+            await self?.runDownloadRetryWorker()
+        }
+    }
+
+    private func runDownloadRetryWorker() async {
+        defer { downloadRetryTask = nil }
+        while !Task.isCancelled {
+            do {
+                try await waitUntilResumed()
+                let retries = try await store.dueDownloadRetries()
+                if !retries.isEmpty {
+                    let rootsByID = Dictionary(uniqueKeysWithValues: try await store.roots().map { ($0.id, $0) })
+                    let discovery = try await currentDiscovery()
+                    for retry in retries {
+                        try await waitUntilResumed()
+                        try Task.checkCancellation()
+                        let pending = retry.file
+                        guard let root = rootsByID[pending.rootID], root.isEnabled, root.isAvailable else {
+                            try await store.rescheduleDownloadRetry(
+                                sourceID: pending.sourceID, attemptCount: retry.attemptCount
+                            )
+                            continue
+                        }
+                        activateSecurityScope(for: root)
+                        guard FileManager.default.fileExists(atPath: pending.url.path) else {
+                            try await store.removeFile(atPath: pending.url.path, rootID: pending.rootID)
+                            continue
+                        }
+                        guard let refreshed = discovery.discoverSingle(root: root, url: pending.url) else {
+                            try await store.rescheduleDownloadRetry(
+                                sourceID: pending.sourceID, attemptCount: retry.attemptCount
+                            )
+                            continue
+                        }
+                        if refreshed.availability == .waitingForDownload {
+                            try? FileManager.default.startDownloadingUbiquitousItem(at: refreshed.url)
+                            try await store.rescheduleDownloadRetry(
+                                sourceID: pending.sourceID, attemptCount: retry.attemptCount
+                            )
+                            continue
+                        }
+                        if refreshed.sourceID != pending.sourceID {
+                            try await store.removeFile(atPath: pending.url.path, rootID: pending.rootID)
+                        }
+                        let before = fileIdentity(at: refreshed.url)
+                        let extracted = await extractor.extract(refreshed)
+                        try await waitUntilResumed()
+                        guard before == fileIdentity(at: refreshed.url) else {
+                            try await store.rescheduleDownloadRetry(
+                                sourceID: pending.sourceID, attemptCount: retry.attemptCount
+                            )
+                            continue
+                        }
+                        try await store.upsert(file: refreshed, document: extracted)
+                    }
+                    scheduleLexicalSync()
+                    startSemanticWorker()
+                }
+                try await Task.sleep(for: .seconds(60))
+            } catch is CancellationError {
+                return
+            } catch {
+                try? await Task.sleep(for: .seconds(60))
+            }
+        }
+    }
     public func indexingPreferences() async throws -> IndexingPreferences { try await store.indexingPreferences() }
     public func folderUsage(limit: Int) async throws -> [IndexFolderUsage] { try await store.folderUsage(limit: limit) }
     public func updateIndexingPreferences(_ preferences: IndexingPreferences) async throws {
@@ -508,6 +579,7 @@ public actor LocalSearchEngine: SearchEngine {
         for root in try await store.roots() where root.isEnabled {
             try await startMonitor(for: root)
         }
+        startDownloadRetryWorker()
     }
 
     public func startupReconciliationIsDue(maximumAge: TimeInterval = 86_400) async throws -> Bool {
@@ -521,6 +593,9 @@ public actor LocalSearchEngine: SearchEngine {
     }
 
     public func stopMonitoring() async {
+        downloadRetryTask?.cancel()
+        await downloadRetryTask?.value
+        downloadRetryTask = nil
         for monitor in monitors.values { monitor.stop() }
         monitors.removeAll()
         for url in activeSecurityScopes.values { url.stopAccessingSecurityScopedResource() }
@@ -529,6 +604,9 @@ public actor LocalSearchEngine: SearchEngine {
 
     public func shutdown() async {
         semanticPaused = true
+        downloadRetryTask?.cancel()
+        await downloadRetryTask?.value
+        downloadRetryTask = nil
         let activeSemanticTask = semanticTask
         activeSemanticTask?.cancel()
         await activeSemanticTask?.value
@@ -1406,28 +1484,44 @@ private actor DiscoveryPipelineState {
 
 final class IndexingWorkGate: @unchecked Sendable {
     private let condition = NSCondition()
+    private let focusedIdleTimeout: TimeInterval
+    private let postSearchQuietPeriod: TimeInterval
     private var isPaused = false
     private var backgrounded = false
     private var activeSearches = 0
     private var searchFieldFocused = false
     private var searchQuietUntil: TimeInterval = 0
+    private var focusedPriorityUntil: TimeInterval = 0
+
+    init(focusedIdleTimeout: TimeInterval = 5 * 60, postSearchQuietPeriod: TimeInterval = 0.5) {
+        self.focusedIdleTimeout = focusedIdleTimeout
+        self.postSearchQuietPeriod = postSearchQuietPeriod
+    }
 
     var shouldYieldToSearch: Bool {
         condition.lock()
         defer { condition.unlock() }
-        return searchFieldFocused || activeSearches > 0 || ProcessInfo.processInfo.systemUptime < searchQuietUntil
+        let now = ProcessInfo.processInfo.systemUptime
+        return activeSearches > 0 || now < searchQuietUntil
+            || (searchFieldFocused && now < focusedPriorityUntil)
     }
 
     func setSearchFieldFocused(_ focused: Bool) {
         condition.lock()
         searchFieldFocused = focused
+        focusedPriorityUntil = focused
+            ? ProcessInfo.processInfo.systemUptime + focusedIdleTimeout
+            : 0
         condition.broadcast()
         condition.unlock()
     }
 
     func noteSearchActivity() {
         condition.lock()
-        searchQuietUntil = ProcessInfo.processInfo.systemUptime + 0.5
+        let now = ProcessInfo.processInfo.systemUptime
+        searchQuietUntil = now + postSearchQuietPeriod
+        if searchFieldFocused { focusedPriorityUntil = now + focusedIdleTimeout }
+        condition.broadcast()
         condition.unlock()
     }
 
@@ -1441,8 +1535,9 @@ final class IndexingWorkGate: @unchecked Sendable {
     private var indexingMustWait: Bool {
         condition.lock()
         defer { condition.unlock() }
-        return isPaused || searchFieldFocused || activeSearches > 0
-            || ProcessInfo.processInfo.systemUptime < searchQuietUntil
+        let now = ProcessInfo.processInfo.systemUptime
+        return isPaused || activeSearches > 0 || now < searchQuietUntil
+            || (searchFieldFocused && now < focusedPriorityUntil)
     }
 
     func indexingCheckpoint() async throws {
@@ -1461,7 +1556,7 @@ final class IndexingWorkGate: @unchecked Sendable {
     func endSearch() {
         condition.lock()
         activeSearches -= 1
-        searchQuietUntil = ProcessInfo.processInfo.systemUptime + 0.5
+        searchQuietUntil = ProcessInfo.processInfo.systemUptime + postSearchQuietPeriod
         condition.broadcast()
         condition.unlock()
     }
@@ -1502,7 +1597,9 @@ final class IndexingWorkGate: @unchecked Sendable {
     func waitUntilResumed() throws {
         condition.lock()
         defer { condition.unlock() }
-        while isPaused || searchFieldFocused || activeSearches > 0 || ProcessInfo.processInfo.systemUptime < searchQuietUntil {
+        while isPaused || activeSearches > 0
+            || ProcessInfo.processInfo.systemUptime < searchQuietUntil
+            || (searchFieldFocused && ProcessInfo.processInfo.systemUptime < focusedPriorityUntil) {
             if Task.isCancelled { throw SearchMyMacError.cancelled }
             condition.wait(until: Date(timeIntervalSinceNow: 0.1))
         }

@@ -33,6 +33,11 @@ struct LexicalDocument: Sendable {
     let input: TantivyDocumentInput
 }
 
+struct DownloadRetry: Sendable {
+    let file: DiscoveredFile
+    let attemptCount: Int
+}
+
 actor ManifestStore {
     // Ranking v3: filename, title, and path matches remain useful recall signals,
     // but a passage with no match in its body must not outrank actual content.
@@ -180,12 +185,14 @@ actor ManifestStore {
     }
 
     func reconciliationIsDue(rootID: String, maximumAge: TimeInterval) throws -> Bool {
-        guard let lastReconciledAt = try database.query(
-            "SELECT last_reconciled_at FROM root_events WHERE root_id = ?",
+        guard let row = try database.query(
+            "SELECT last_reconciled_at, discovery_error_count FROM root_events WHERE root_id = ?",
             bindings: [.text(rootID)]
-        ).first?["last_reconciled_at"]?.double else {
+        ).first else {
             return true
         }
+        if row["discovery_error_count"]?.int64 ?? 0 > 0 { return true }
+        guard let lastReconciledAt = row["last_reconciled_at"]?.double else { return true }
         return Date.now.timeIntervalSince1970 - lastReconciledAt >= maximumAge
     }
 
@@ -328,7 +335,7 @@ actor ManifestStore {
             SELECT source_id, root_id, path, modified_at, size, availability
             FROM scan_items
             WHERE scan_id = ? AND processed = 0
-            ORDER BY rowid
+            ORDER BY modified_at IS NULL, modified_at DESC, rowid
             LIMIT ?
             """,
             bindings: [.text(scanID), .integer(Int64(max(1, limit)))]
@@ -436,6 +443,17 @@ actor ManifestStore {
                     .integer(Int64(DocumentExtractor.extractionRecipeVersion(forExtension: file.url.pathExtension)))
                 ]
             )
+            if availability == .waitingForDownload {
+                try database.execute(
+                    """
+                    INSERT OR IGNORE INTO download_retries(source_id, next_retry_at, attempt_count)
+                    VALUES(?, ?, 0)
+                    """,
+                    bindings: [.text(file.sourceID), .real(Date.now.timeIntervalSince1970 + 5 * 60)]
+                )
+            } else {
+                try database.execute("DELETE FROM download_retries WHERE source_id = ?", bindings: [.text(file.sourceID)])
+            }
 
             let passages = document?.passages.isEmpty == false
                 ? document!.passages
@@ -1083,6 +1101,44 @@ actor ManifestStore {
         }
     }
 
+    func dueDownloadRetries(now: Date = .now, limit: Int = 64) throws -> [DownloadRetry] {
+        try database.query(
+            """
+            SELECT f.source_id, f.root_id, f.path, f.modified_at, f.size, f.availability,
+                   r.attempt_count
+            FROM download_retries r JOIN files f ON f.source_id = r.source_id
+            WHERE r.next_retry_at <= ?
+            ORDER BY r.next_retry_at
+            LIMIT ?
+            """,
+            bindings: [.real(now.timeIntervalSince1970), .integer(Int64(max(1, limit)))]
+        ).compactMap { row in
+            guard let sourceID = row["source_id"]?.string,
+                  let rootID = row["root_id"]?.string,
+                  let path = row["path"]?.string else { return nil }
+            return DownloadRetry(
+                file: DiscoveredFile(
+                    sourceID: sourceID,
+                    rootID: rootID,
+                    url: URL(fileURLWithPath: path),
+                    modifiedAt: row["modified_at"]?.double.map(Date.init(timeIntervalSince1970:)),
+                    size: row["size"]?.int64 ?? 0,
+                    availability: ContentAvailability(rawValue: row["availability"]?.string ?? "") ?? .waitingForDownload
+                ),
+                attemptCount: Int(row["attempt_count"]?.int64 ?? 0)
+            )
+        }
+    }
+
+    func rescheduleDownloadRetry(sourceID: String, attemptCount: Int, now: Date = .now) throws {
+        let nextAttempt = min(max(attemptCount + 1, 1), 16)
+        let delay = min(5 * 60 * pow(2, Double(nextAttempt - 1)), 6 * 60 * 60)
+        try database.execute(
+            "UPDATE download_retries SET next_retry_at = ?, attempt_count = ? WHERE source_id = ?",
+            bindings: [.real(now.timeIntervalSince1970 + delay), .integer(Int64(nextAttempt)), .text(sourceID)]
+        )
+    }
+
     func indexingPreferences() throws -> IndexingPreferences {
         guard let data = try database.query(
             "SELECT value FROM index_preferences WHERE key = 'preferences'"
@@ -1299,6 +1355,16 @@ actor ManifestStore {
         try database.execute("CREATE INDEX IF NOT EXISTS files_path_idx ON files(path)")
         try database.execute(
             """
+            CREATE TABLE IF NOT EXISTS download_retries(
+                source_id TEXT PRIMARY KEY REFERENCES files(source_id) ON DELETE CASCADE,
+                next_retry_at REAL NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        try database.execute("CREATE INDEX IF NOT EXISTS download_retries_due_idx ON download_retries(next_retry_at)")
+        try database.execute(
+            """
             CREATE TABLE IF NOT EXISTS scan_items(
                 scan_id TEXT NOT NULL,
                 source_id TEXT NOT NULL,
@@ -1314,6 +1380,9 @@ actor ManifestStore {
         )
         try? database.execute("ALTER TABLE scan_items ADD COLUMN processed INTEGER NOT NULL DEFAULT 0")
         try database.execute("CREATE INDEX IF NOT EXISTS scan_items_root_idx ON scan_items(root_id)")
+        try database.execute(
+            "CREATE INDEX IF NOT EXISTS scan_items_pending_idx ON scan_items(scan_id, processed, modified_at DESC)"
+        )
         try database.execute(
             """
             CREATE TABLE IF NOT EXISTS passages(
@@ -1422,6 +1491,7 @@ actor ManifestStore {
     private func deleteFile(sourceID: String) throws {
         let nextGeneration = try generation() + 1
         try deletePassages(sourceID: sourceID)
+        try database.execute("DELETE FROM download_retries WHERE source_id = ?", bindings: [.text(sourceID)])
         try database.execute("DELETE FROM files WHERE source_id = ?", bindings: [.text(sourceID)])
         try database.execute(
             "INSERT OR REPLACE INTO lexical_operations(source_id, generation, operation) VALUES(?, ?, 'delete')",

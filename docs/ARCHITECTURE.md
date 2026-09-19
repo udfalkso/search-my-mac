@@ -26,13 +26,29 @@ reconciliation, filesystem-event processing before database access, background
 model loading/inference, vector writes and rebuilds, and extraction between PDF
 pages and before OCR. Text-mode startup defers optional model loading until idle;
 loading required for a selected semantic mode remains foreground preparation.
+Filesystem monitoring and incomplete-scan recovery start before optional model
+loading so Metal/model initialization cannot delay discovery of new files.
 Waiting background tasks remain cancellable, and releasing search priority does
-not release an explicit indexing pause. A running synchronous parser call,
+not release an explicit indexing pause. Focus priority expires after five
+minutes without typing so an open search window cannot starve indexing; the
+next keystroke immediately restores priority. A running synchronous parser call,
 database transaction, native index operation, or GPU decode cannot be suspended
 mid-operation; it completes its current unit before the next checkpoint. Search
 execution, its result rendering/preview, and explicitly requested settings work
 remain foreground operations. Filesystem notifications are retained for later
 processing rather than discarded while searching.
+
+iCloud and File Provider items are considered unavailable only when macOS
+explicitly reports that they are not downloaded or are actively downloading.
+A missing download-status value is treated as resident because providers can
+omit it for fully local files. True placeholders are indexed by filename and
+persisted in a retry queue. The app requests their download after five minutes,
+rechecks them with exponential backoff capped at six hours, and extracts their
+contents once resident. Incomplete filesystem reconciliations are retried on
+the next launch instead of being treated as current coverage.
+During reconciliation, newly modified staged files are extracted before older
+backlog entries so a document just added by the user becomes searchable early
+in a large Home scan.
 
 For local search profiling, launch the assembled app with
 `open --env SMM_PROFILE_SEARCH=1 ".build/Search My Mac.app"` after quitting the
