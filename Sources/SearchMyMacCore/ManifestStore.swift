@@ -529,6 +529,9 @@ actor ManifestStore {
     }
 
     func search(_ request: SearchRequest, recordInHistory: Bool = true) throws -> SearchResponse {
+        let trace = SearchPerformanceTrace(requestID: request.id)
+        trace.mark("fts-store-entered")
+        defer { trace.mark("fts-store-finished") }
         let match = try parser.parse(request.query)
         let currentGeneration = try generation()
         let offset = try cursorOffset(request.cursor, expectedGeneration: currentGeneration)
@@ -583,6 +586,7 @@ actor ManifestStore {
             LIMIT ? OFFSET ?
             """
         let rows = try database.query(sql, bindings: bindings)
+        trace.mark("fts-sql-finished", details: "rows=\(rows.count)")
         let terms = parser.highlightTerms(request.query)
         var grouped: [String: [PassageMatch]] = [:]
         for row in rows {

@@ -56,6 +56,10 @@ let package = Package(
             dependencies: ["SearchMyMacCore"]
         ),
         .testTarget(
+            name: "SearchMyMacAppTests",
+            dependencies: ["SearchMyMacApp"]
+        ),
+        .testTarget(
             name: "SearchMyMacCoreTests",
             dependencies: ["SearchMyMacCore"]
         ),

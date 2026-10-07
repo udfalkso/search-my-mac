@@ -8,7 +8,8 @@ final class WordMatchNavigator {
         case found
         case notFound
         case notReady
-        case failed
+        case failed(String)
+        case cancelled
     }
 
     private static let wordBundleIdentifier = "com.microsoft.Word"
@@ -24,11 +25,11 @@ final class WordMatchNavigator {
         return wordApplicationURL != nil
     }
 
-    func openInWord(_ documentURL: URL) -> Bool {
+    func openInWord(_ documentURL: URL) async throws -> Bool {
         guard let wordApplicationURL else { return false }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
-        NSWorkspace.shared.open(
+        _ = try await NSWorkspace.shared.open(
             [documentURL],
             withApplicationAt: wordApplicationURL,
             configuration: configuration
@@ -36,18 +37,22 @@ final class WordMatchNavigator {
         return true
     }
 
-    func navigate(documentURL: URL, anchors: [String]) -> NavigationResult {
+    func navigate(documentURL: URL, anchors: [String]) async -> NavigationResult {
         guard !anchors.isEmpty else { return .notFound }
         let source = Self.appleScriptSource(documentURL: documentURL, anchors: anchors)
-        guard let script = NSAppleScript(source: source) else { return .failed }
-        var error: NSDictionary?
-        let descriptor = script.executeAndReturnError(&error)
-        guard error == nil, let result = descriptor.stringValue else { return .failed }
+        // Apple events can wait indefinitely on another application. Run them
+        // outside our UI process and bound the entire navigation attempt.
+        let result: String
+        switch await BoundedScriptProcess.execute(source: source) {
+        case let .success(value): result = value
+        case let .failure(message): return .failed(message)
+        case .cancelled: return .cancelled
+        }
         return switch result {
         case "found": .found
         case "not-found": .notFound
         case "not-ready": .notReady
-        default: .failed
+        default: .failed("Word returned an unexpected navigation response.")
         }
     }
 
@@ -141,17 +146,20 @@ final class WordMatchNavigator {
         return prefix.substring(to: lastSpace)
     }
 
-    private static func appleScriptSource(documentURL: URL, anchors: [String]) -> String {
+    static func appleScriptSource(documentURL: URL, anchors: [String]) -> String {
         let path = appleScriptLiteral(documentURL.path)
         let anchorList = anchors.map(appleScriptLiteral).joined(separator: ", ")
         return """
         tell application id "com.microsoft.Word"
-            set targetFile to POSIX file \(path)
+            set targetPath to (POSIX file \(path)) as text
             set targetDocument to missing value
-            repeat with candidateWindow in windows
+            -- Fetch a concrete list before iterating. Word rejects the implicit
+            -- count event AppleScript sends when iterating its windows specifier.
+            set openDocuments to get documents
+            repeat with candidateReference in openDocuments
                 try
-                    set candidateDocument to document of candidateWindow
-                    if (full name of candidateDocument) is targetFile then
+                    set candidateDocument to contents of candidateReference
+                    if (full name of candidateDocument as text) is targetPath then
                         set targetDocument to candidateDocument
                         exit repeat
                     end if
@@ -167,7 +175,7 @@ final class WordMatchNavigator {
                 set matchFinder to find object of selection
                 tell matchFinder
                     clear formatting
-                    set didFind to execute find find text (contents of candidateText) wrap find stop with match forward without find format
+                    set didFind to execute find find text (contents of candidateText) wrap find stop with match forward without find format, match case, match whole word, match wildcards, match sounds like, match all word forms
                 end tell
                 if didFind then
                     activate object targetDocument

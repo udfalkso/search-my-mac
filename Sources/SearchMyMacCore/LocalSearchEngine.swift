@@ -113,11 +113,13 @@ public actor LocalSearchEngine: SearchEngine {
 
     private func performSearch(_ request: SearchRequest) async throws -> SearchResponse {
         let trace = SearchPerformanceTrace(requestID: request.id)
+        trace.mark("engine-actor-entered")
         try Task.checkCancellation()
         guard request.mode != .text, semanticState.isSearchReady, let embeddingModel else {
             return try await removingExcludedHits(from: lexicalSearch(request, recordInHistory: true))
         }
         let query = request.query
+        trace.mark("query-embedding-start")
         let queryVector = try await Self.embedQuery(query, using: embeddingModel)
         trace.mark("query-embedded")
         try Task.checkCancellation()
@@ -849,16 +851,23 @@ public actor LocalSearchEngine: SearchEngine {
         defer { trace.mark("lexical-finished") }
         try Task.checkCancellation()
         if lexicalMaintenanceInFlight {
+            trace.mark("fts-start", details: "reason=maintenance")
             return try await store.search(request, recordInHistory: recordInHistory)
         }
-        guard let lexicalEngine else { return try await store.search(request, recordInHistory: recordInHistory) }
+        guard let lexicalEngine else {
+            trace.mark("fts-start", details: "reason=no-tantivy")
+            return try await store.search(request, recordInHistory: recordInHistory)
+        }
+        trace.mark("generation-read-start")
         let generation = try await store.generation()
         trace.mark("generation-read")
         if lexicalMaintenanceInFlight {
+            trace.mark("fts-start", details: "reason=maintenance-after-generation")
             return try await store.search(request, recordInHistory: recordInHistory)
         }
         let committed = try lexicalEngine.committedGeneration()
         guard committed == generation else {
+            trace.mark("fts-start", details: "reason=generation-mismatch")
             scheduleLexicalSync()
             return try await store.search(request, recordInHistory: recordInHistory)
         }
@@ -870,6 +879,7 @@ public actor LocalSearchEngine: SearchEngine {
         } else {
             offset = 0
         }
+        trace.mark("tantivy-start")
         let output = try lexicalEngine.search(request, offset: offset)
         trace.mark("tantivy-searched")
         if recordInHistory { try await store.recordSearch(query: request.query, mode: request.mode) }

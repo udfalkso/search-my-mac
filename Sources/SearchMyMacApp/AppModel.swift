@@ -44,6 +44,7 @@ final class AppModel: ObservableObject {
 
     private let engine: LocalSearchEngine?
     private let wordMatchNavigator = WordMatchNavigator()
+    private var wordNavigationTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
     /// Changes for every request so an older asynchronous result can never
     /// repaint the UI after a newer query, mode, or filter selection.
@@ -62,6 +63,7 @@ final class AppModel: ObservableObject {
     private static let hybridSemanticWeightKey = "hybridSemanticWeight"
 
     init() {
+        DiagnosticLog.shared.record("app-model-init-start")
         mode = UserDefaults.standard.string(forKey: Self.preferredSearchModeKey)
             .flatMap(SearchMode.init(rawValue:)) ?? .hybrid
         let storedHybridWeight = UserDefaults.standard.object(forKey: Self.hybridSemanticWeightKey) as? Double
@@ -73,12 +75,14 @@ final class AppModel: ObservableObject {
             errorMessage = error.localizedDescription
         }
         launchAtLogin = SMAppService.mainApp.status == .enabled
+        DiagnosticLog.shared.record("app-engine-created")
         historyRecordingEnabled = UserDefaults.standard.object(forKey: "historyRecordingEnabled") as? Bool ?? true
         startupTask = Task {
             await engine?.setApplicationIsActive(NSApplication.shared.isActive)
             await engine?.setHistoryRecording(historyRecordingEnabled)
             await refreshAll()
             hasLoadedInitialState = true
+            DiagnosticLog.shared.record("app-initial-state-loaded")
             do {
                 try await engine?.waitForSearchIdle()
                 try await engine?.startMonitoring()
@@ -137,6 +141,7 @@ final class AppModel: ObservableObject {
     }
 
     func shutdown() async {
+        wordNavigationTask?.cancel()
         let activeTasks = [
             startupTask, searchTask, indexTask, progressTask,
             reconciliationTask, semanticProgressTask
@@ -154,12 +159,25 @@ final class AppModel: ObservableObject {
         await engine?.shutdown()
     }
 
+    func updateSearchQuery(_ value: String) {
+        guard value != query else { return }
+        query = value
+        // Publish pending state and launch its request together. View lifecycle
+        // callbacks must not be responsible for completing this transition.
+        scheduleSearch()
+    }
+
+    func recordResultsPresented() {
+        DiagnosticLog.shared.record("ui-results-view-appeared", requestID: activeSearchID?.uuidString,
+                                    details: "hits=\(results.count)")
+    }
+
     func scheduleSearch(immediately: Bool = false) {
         searchTask?.cancel()
         engine?.prioritizeSearch()
         let searchID = UUID()
         let trace = SearchPerformanceTrace(requestID: searchID)
-        trace.mark("ui-scheduled")
+        trace.mark("ui-scheduled", details: "mode=\(mode.rawValue) type_filters=\(filters.extensions.sorted().joined(separator: ",")) query=\(query)")
         activeSearchID = searchID
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             results = []
@@ -175,6 +193,7 @@ final class AppModel: ObservableObject {
         let hybridSemanticWeightSnapshot = hybridSemanticWeight
         isSearching = true
         searchTask = Task(priority: .userInitiated) {
+            defer { trace.mark("ui-task-finished", details: "cancelled=\(Task.isCancelled)") }
             // Let the UI present the pending state before starting engine work,
             // including searches submitted without the typing debounce.
             await Task.yield()
@@ -182,6 +201,7 @@ final class AppModel: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(120))
             }
             guard !Task.isCancelled, activeSearchID == searchID else { return }
+            trace.mark("ui-debounce-finished")
             isSearching = true
             defer {
                 if activeSearchID == searchID {
@@ -201,7 +221,7 @@ final class AppModel: ObservableObject {
                 )
                 guard !Task.isCancelled, activeSearchID == searchID else { return }
                 results = response.hits
-                trace.mark("ui-results-assigned")
+                trace.mark("ui-results-assigned", details: "hits=\(response.hits.count) effective_mode=\(response.effectiveMode.rawValue)")
                 if let selectedHitPath,
                    response.hits.contains(where: { $0.path == selectedHitPath }) {
                     self.selectedHitPath = selectedHitPath
@@ -209,8 +229,13 @@ final class AppModel: ObservableObject {
                     selectedHitPath = response.hits.first?.path
                 }
                 effectiveMode = response.effectiveMode
-                history = try await engine.history(limit: 100)
+                isSearching = false
+                let refreshedHistory = try await engine.history(limit: 100)
+                guard !Task.isCancelled, activeSearchID == searchID else { return }
+                history = refreshedHistory
+                trace.mark("ui-history-refreshed")
             } catch {
+                trace.mark("ui-search-error", details: "cancelled=\(Task.isCancelled) code=\((error as NSError).code)")
                 if !Task.isCancelled { errorMessage = error.localizedDescription }
             }
         }
@@ -579,33 +604,58 @@ final class AppModel: ObservableObject {
     }
 
     func open(_ hit: SearchHit) {
+        DiagnosticLog.shared.record("file-open-requested", details: "type=\(hit.fileExtension)")
+        wordNavigationTask?.cancel()
         let anchors = WordMatchNavigator.searchAnchors(for: hit)
         guard wordMatchNavigator.canNavigate(hit), !anchors.isEmpty else {
             openNormally(hit)
             return
         }
-        guard wordMatchNavigator.openInWord(hit.url) else {
-            openNormally(hit)
-            return
-        }
-        Task { [weak self] in
+        wordNavigationTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                DiagnosticLog.shared.record("word-open-start")
+                guard try await wordMatchNavigator.openInWord(hit.url) else {
+                    openNormally(hit)
+                    return
+                }
+                DiagnosticLog.shared.record("word-open-completed")
+            } catch {
+                errorMessage = "Could not open \(hit.url.lastPathComponent): \(error.localizedDescription)"
+                return
+            }
             // Opening Word returns before its document object is necessarily
             // available. Retry only while that exact file is still loading.
             for attempt in 0..<12 {
                 try? await Task.sleep(for: .milliseconds(attempt == 0 ? 650 : 250))
-                guard !Task.isCancelled, let self else { return }
-                switch self.wordMatchNavigator.navigate(documentURL: hit.url, anchors: anchors) {
+                guard !Task.isCancelled else { return }
+                let navigation = await self.wordMatchNavigator.navigate(documentURL: hit.url, anchors: anchors)
+                guard !Task.isCancelled else { return }
+                switch navigation {
                 case .notReady:
                     continue
-                case .found, .notFound, .failed:
+                case .found, .cancelled:
+                    return
+                case .notFound:
+                    errorMessage = "Word opened \(hit.url.lastPathComponent), but could not locate the matching passage. The document may have changed since it was indexed."
+                    return
+                case let .failed(message):
+                    errorMessage = "Could not jump to the match in \(hit.url.lastPathComponent). \(message)"
                     return
                 }
             }
+            errorMessage = "Word opened \(hit.url.lastPathComponent), but its document was not ready for navigation. Try Open at Match again once it has finished loading."
         }
     }
 
     func openNormally(_ hit: SearchHit) {
-        NSWorkspace.shared.open(hit.url)
+        wordNavigationTask?.cancel()
+        NSWorkspace.shared.open(hit.url, configuration: NSWorkspace.OpenConfiguration()) { [weak self] _, error in
+            guard let error else { return }
+            Task { @MainActor [weak self] in
+                self?.errorMessage = "Could not open \(hit.url.lastPathComponent): \(error.localizedDescription)"
+            }
+        }
     }
 
     func quickLook(_ hit: SearchHit) { QuickLookController.shared.show(hit.url) }

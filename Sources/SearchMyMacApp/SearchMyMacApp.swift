@@ -11,7 +11,7 @@ struct SearchMyMacApplication: App {
     @AppStorage(AppAppearance.storageKey) private var appearance = AppAppearance.system.rawValue
 
     var body: some Scene {
-        WindowGroup("Search My Mac", id: MainWindowOpener.windowID) {
+        Window("Search My Mac", id: MainWindowOpener.windowID) {
             ContentView()
                 .environmentObject(model)
                 .environmentObject(updates)
@@ -82,6 +82,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var forcedTerminationTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        DiagnosticLog.shared.record("app-launched", details: "version=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown") build=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown")")
         GlobalHotKeyController.shared.start()
     }
 
@@ -93,13 +94,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // icon does nothing and the app is stuck running with no way to show a window.
     // Recreate the main window whenever the Dock icon is clicked with none open.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
-        if !hasVisibleWindows {
-            MainWindowOpener.shared.open()
-        }
-        return true
+        DiagnosticLog.shared.record("app-reopen", details: "visible_windows=\(hasVisibleWindows)")
+        MainWindowOpener.shared.open()
+        return false
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        DiagnosticLog.shared.record("app-quit-requested")
         guard let model else {
             Darwin._exit(EXIT_SUCCESS)
         }
@@ -154,7 +155,14 @@ final class MainWindowOpener {
 
     func open() {
         NSApp.activate(ignoringOtherApps: true)
-        openAction?()
+        if let window = NSApp.windows.first(where: { $0.frameAutosaveName == "SearchMyMacMainWindow" }) {
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            // Let AppKit finish processing the reopen event before SwiftUI
+            // creates a replacement for a closed window.
+            DispatchQueue.main.async { [weak self] in self?.openAction?() }
+        }
     }
 }
 

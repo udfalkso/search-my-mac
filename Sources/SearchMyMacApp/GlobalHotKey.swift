@@ -29,14 +29,7 @@ final class GlobalHotKeyController {
                 )
                 guard status == noErr, identifier.id == 1 else { return OSStatus(eventNotHandledErr) }
                 Task { @MainActor in
-                    NSApp.activate(ignoringOtherApps: true)
-                    if let window = NSApp.windows.first(where: { $0.canBecomeKey }) {
-                        window.makeKeyAndOrderFront(nil)
-                    } else {
-                        // No window exists (the last one was closed while the app
-                        // kept running); re-create it rather than no-op.
-                        MainWindowOpener.shared.open()
-                    }
+                    MainWindowOpener.shared.open()
                     NotificationCenter.default.post(name: .focusSearchMyMacField, object: nil)
                 }
                 return noErr

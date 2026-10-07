@@ -897,20 +897,12 @@ private struct SearchToolbar: View {
                     )
                 TextField("Search filenames and document text", text: Binding(
                     get: { model.query },
-                    set: { value in
-                        model.query = value
-                        model.results = []
-                        model.selectedHitPath = nil
-                        // Publish feedback in the text-edit callback itself;
-                        // scheduling and debouncing happen in onChange below.
-                        model.isSearching = !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    }
+                    set: { model.updateSearchQuery($0) }
                 ))
                     .textFieldStyle(.plain)
                     .font(.system(size: 18))
                     .focused($focused)
                     .onSubmit { model.scheduleSearch() }
-                    .onChange(of: model.query) { _ in model.scheduleSearch() }
                 if model.isSearching {
                     HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
@@ -924,7 +916,7 @@ private struct SearchToolbar: View {
                     .transaction { $0.animation = nil }
                 }
                 if !model.query.isEmpty {
-                    Button { model.query = ""; model.results = [] } label: { Image(systemName: "xmark.circle.fill") }
+                    Button { model.updateSearchQuery("") } label: { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.plain).foregroundStyle(.secondary)
                     Button { model.saveCurrentSearch() } label: {
                         Image(systemName: "bookmark")
@@ -1775,6 +1767,7 @@ private struct ResultsView: View {
                 .frame(width: 0, height: 0)
             )
         }
+        .onAppear { model.recordResultsPresented() }
     }
 
     private var resultGroups: [ResultGroup] {
