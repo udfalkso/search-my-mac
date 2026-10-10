@@ -1,5 +1,8 @@
 // swift-tools-version: 6.0
 import PackageDescription
+import Foundation
+
+let isAppStore = ProcessInfo.processInfo.environment["SMM_APP_STORE"] == "1"
 
 let package = Package(
     name: "SearchMyMac",
@@ -12,9 +15,8 @@ let package = Package(
         .executable(name: "SearchMyMacEngineService", targets: ["SearchMyMacEngineService"])
     ],
     dependencies: [
-        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.9.2"),
         .package(url: "https://github.com/unum-cloud/USearch.git", exact: "2.26.0")
-    ],
+    ] + (isAppStore ? [] : [.package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.9.2")]),
     targets: [
         .systemLibrary(name: "CSQLite"),
         .target(
@@ -34,9 +36,9 @@ let package = Package(
         .executableTarget(
             name: "SearchMyMacApp",
             dependencies: [
-                "SearchMyMacCore",
-                .product(name: "Sparkle", package: "Sparkle")
-            ],
+                "SearchMyMacCore"
+            ] + (isAppStore ? [] : [.product(name: "Sparkle", package: "Sparkle")]),
+            swiftSettings: isAppStore ? [.define("SMM_APP_STORE")] : [],
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("QuickLookUI"),

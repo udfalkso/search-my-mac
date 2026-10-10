@@ -65,7 +65,7 @@ final class AppModel: ObservableObject {
     init() {
         DiagnosticLog.shared.record("app-model-init-start")
         mode = UserDefaults.standard.string(forKey: Self.preferredSearchModeKey)
-            .flatMap(SearchMode.init(rawValue:)) ?? .hybrid
+            .flatMap(SearchMode.init(rawValue:)) ?? .text
         let storedHybridWeight = UserDefaults.standard.object(forKey: Self.hybridSemanticWeightKey) as? Double
         hybridSemanticWeight = min(max(storedHybridWeight ?? SearchRequest.defaultHybridSemanticWeight, 0), 1)
         do {
@@ -102,10 +102,6 @@ final class AppModel: ObservableObject {
                 try await engine?.resumeSemanticIndexing()
                 if let engine {
                     semanticStatus = await engine.semanticStatus()
-                    if UserDefaults.standard.string(forKey: Self.preferredSearchModeKey) == nil,
-                       semanticStatus.phase != .notInstalled {
-                        mode = .hybrid
-                    }
                 }
             }
             catch is CancellationError { return }
@@ -267,8 +263,12 @@ final class AppModel: ObservableObject {
     }
 
     func indexEntireHome() {
+        #if SMM_APP_STORE
+        chooseAndIndexFolder()
+        #else
         let root = IndexRoot(id: "home", url: FileManager.default.homeDirectoryForCurrentUser, displayName: "Home")
         startIndex(root)
+        #endif
     }
 
     func chooseAndIndexFolder() {
@@ -600,10 +600,17 @@ final class AppModel: ObservableObject {
     }
 
     func opensAtMatch(_ hit: SearchHit) -> Bool {
+        #if SMM_APP_STORE
+        false
+        #else
         wordMatchNavigator.canNavigate(hit)
+        #endif
     }
 
     func open(_ hit: SearchHit) {
+        #if SMM_APP_STORE
+        openNormally(hit)
+        #else
         DiagnosticLog.shared.record("file-open-requested", details: "type=\(hit.fileExtension)")
         wordNavigationTask?.cancel()
         let anchors = WordMatchNavigator.searchAnchors(for: hit)
@@ -646,6 +653,7 @@ final class AppModel: ObservableObject {
             }
             errorMessage = "Word opened \(hit.url.lastPathComponent), but its document was not ready for navigation. Try Open at Match again once it has finished loading."
         }
+        #endif
     }
 
     func openNormally(_ hit: SearchHit) {

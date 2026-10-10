@@ -1,5 +1,7 @@
 import Foundation
+#if !SMM_APP_STORE
 import Sparkle
+#endif
 
 enum UpdateCheckFrequency: TimeInterval, CaseIterable, Identifiable {
     case daily = 86_400
@@ -21,6 +23,10 @@ enum UpdateCheckFrequency: TimeInterval, CaseIterable, Identifiable {
     }
 }
 
+#if SMM_APP_STORE
+@MainActor
+final class UpdateController: NSObject, ObservableObject {}
+#else
 @MainActor
 final class UpdateController: NSObject, ObservableObject, SPUUpdaterDelegate {
     private lazy var standardUpdaterController = SPUStandardUpdaterController(
@@ -101,3 +107,4 @@ final class UpdateController: NSObject, ObservableObject, SPUUpdaterDelegate {
         checkFrequency = frequency
     }
 }
+#endif

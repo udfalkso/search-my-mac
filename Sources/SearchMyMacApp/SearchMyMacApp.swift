@@ -6,20 +6,30 @@ import SwiftUI
 @main
 struct SearchMyMacApplication: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    #if SMM_APP_STORE
+    @StateObject private var purchases = StorePurchaseController()
+    #else
     @StateObject private var model = AppModel()
+    #endif
     @StateObject private var updates = UpdateController()
     @AppStorage(AppAppearance.storageKey) private var appearance = AppAppearance.system.rawValue
 
     var body: some Scene {
         Window("Search My Mac", id: MainWindowOpener.windowID) {
-            ContentView()
-                .environmentObject(model)
+            mainContent
                 .environmentObject(updates)
                 .preferredColorScheme(selectedAppearance.colorScheme)
                 .frame(minWidth: 920, minHeight: 620)
                 .background(WindowFrameAutosaver(name: "SearchMyMacMainWindow"))
                 .background(MainWindowOpenerCapture())
+                #if SMM_APP_STORE
+                .onReceive(purchases.$model) { appDelegate.model = $0 }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    Task { await purchases.refreshAccess() }
+                }
+                #else
                 .onAppear { appDelegate.model = model }
+                #endif
         }
         .windowToolbarStyle(.unifiedCompact(showsTitle: false))
         .commands {
@@ -35,17 +45,52 @@ struct SearchMyMacApplication: App {
                 }
                 .keyboardShortcut(",", modifiers: [.command])
             }
+            #if !SMM_APP_STORE
             CommandGroup(after: .appInfo) {
                 Button("Check for Updates…") {
                     updates.checkForUpdates()
                 }
                 .disabled(!updates.canCheckForUpdates)
             }
+            #endif
+            #if SMM_APP_STORE
+            CommandGroup(after: .appInfo) {
+                Button("Restore Purchases…") { Task { await purchases.restore() } }
+                    .disabled(purchases.isBusy)
+            }
+            #endif
         }
     }
 
     private var selectedAppearance: AppAppearance {
         AppAppearance(rawValue: appearance) ?? .system
+    }
+
+    @ViewBuilder
+    private var mainContent: some View {
+        #if SMM_APP_STORE
+        if purchases.hasCheckedAccess, purchases.access.allowsSearch, let model = purchases.model {
+            VStack(spacing: 0) {
+                if case .trial(let expiry) = purchases.access {
+                    HStack {
+                        Text("Free trial ends \(expiry.formatted(date: .abbreviated, time: .shortened))")
+                        Spacer()
+                        Button(purchases.unlockPrice.map { "Unlock for \($0)" } ?? "Unlock") {
+                            Task { await purchases.purchase(StoreAccessPolicy.unlockProductID) }
+                        }
+                        .disabled(purchases.isBusy || purchases.unlockPrice == nil)
+                    }
+                    .font(.callout).padding(12)
+                    Divider()
+                }
+                ContentView().environmentObject(model)
+            }
+        } else {
+            StoreAccessView(purchases: purchases)
+        }
+        #else
+        ContentView().environmentObject(model)
+        #endif
     }
 }
 

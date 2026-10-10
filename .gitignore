@@ -6,3 +6,4 @@ rust-extractor/target/
 DerivedData/
 Search My Mac.app/
 .smm-signing.env
+.asc/

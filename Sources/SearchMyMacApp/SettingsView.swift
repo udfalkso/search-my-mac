@@ -22,7 +22,9 @@ struct SettingsView: View {
 
                 Picker("Settings section", selection: $selectedTab) {
                     Text("General").tag("general")
+                    #if !SMM_APP_STORE
                     Text("Updates").tag("updates")
+                    #endif
                     Text("Semantic").tag("semantic")
                     Text("Privacy").tag("privacy")
                 }
@@ -42,13 +44,16 @@ struct SettingsView: View {
     @ViewBuilder
     private var selectedSettings: some View {
         switch selectedTab {
+        #if !SMM_APP_STORE
         case "updates": updatesSettings
+        #endif
         case "semantic": semanticSettings
         case "privacy": privacySettings
         default: generalSettings
         }
     }
 
+    #if !SMM_APP_STORE
     private var updatesSettings: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 26) {
@@ -170,6 +175,8 @@ struct SettingsView: View {
         }
         .onAppear { updates.refresh() }
     }
+
+    #endif
 
     private var generalSettings: some View {
         ScrollView {
@@ -366,6 +373,8 @@ struct SettingsView: View {
                         title: "No document uploads",
                         detail: "Network access is never used to process your documents or answer searches."
                     )
+                    Link("Privacy Policy", destination: URL(string: "https://github.com/udfalkso/search-my-mac/blob/main/docs/PRIVACY.md")!)
+                    Link("Support", destination: URL(string: "https://github.com/udfalkso/search-my-mac/blob/main/docs/SUPPORT.md")!)
                 }
             }
             .frame(maxWidth: 680, alignment: .leading)

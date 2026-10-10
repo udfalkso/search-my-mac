@@ -2477,7 +2477,9 @@ private struct OnboardingView: View {
             Text("Search My Mac builds a private local index. Your documents and searches never leave this Mac.")
                 .foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 520)
             HStack {
+                #if !SMM_APP_STORE
                 Button("Index Entire Home") { model.indexEntireHome() }.buttonStyle(.borderedProminent).controlSize(.large)
+                #endif
                 Button("Choose a Folder…") { model.chooseAndIndexFolder() }.buttonStyle(.bordered).controlSize(.large)
             }
             Text("System folders, caches, dependencies, build output, and sensitive credentials are excluded by default.")
